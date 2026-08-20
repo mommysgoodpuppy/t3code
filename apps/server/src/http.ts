@@ -12,6 +12,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
+import * as Stream from "effect/Stream";
 import { cast } from "effect/Function";
 import {
   HttpBody,
@@ -44,6 +47,347 @@ const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+const LM_TOOLS_CAMPAIGN_ROUTE = "/api/lm-tools/campaign";
+const LM_TOOLS_CAMPAIGN_EVENTS_ROUTE = "/api/lm-tools/campaign/events";
+
+function readOptionalJson(fileSystem: FileSystem.FileSystem, path: string) {
+  return fileSystem.readFileString(path).pipe(
+    Effect.map((contents) => JSON.parse(contents) as unknown),
+    Effect.orElseSucceed(() => null),
+  );
+}
+
+function readModelInference(httpClient: HttpClient.HttpClient) {
+  return Effect.gen(function* () {
+    const modelUrl = process.env.LM_TOOLS_MODEL_URL;
+    if (!modelUrl) return null;
+    const slots = yield* httpClient.get(new URL("/slots", modelUrl).toString()).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.json),
+      Effect.timeout("750 millis"),
+    );
+    if (!Array.isArray(slots)) return null;
+    const candidates = slots.filter(
+      (slot): slot is Record<string, unknown> =>
+        slot !== null && typeof slot === "object" && !Array.isArray(slot),
+    );
+    const slot = candidates.find((candidate) => candidate.is_processing === true) ?? candidates[0];
+    if (!slot) return null;
+    const nextTokens = Array.isArray(slot.next_token) ? slot.next_token : [];
+    const nextToken = nextTokens.find(
+      (candidate): candidate is Record<string, unknown> =>
+        candidate !== null && typeof candidate === "object" && !Array.isArray(candidate),
+    );
+    const contextLimit = typeof slot.n_ctx === "number" ? slot.n_ctx : 0;
+    const promptTokens = typeof slot.n_prompt_tokens === "number" ? slot.n_prompt_tokens : 0;
+    const cachedPromptTokens =
+      typeof slot.n_prompt_tokens_cache === "number" ? slot.n_prompt_tokens_cache : 0;
+    const processedPromptTokens =
+      typeof slot.n_prompt_tokens_processed === "number" ? slot.n_prompt_tokens_processed : 0;
+    const generatedTokens = typeof nextToken?.n_decoded === "number" ? nextToken.n_decoded : 0;
+    // llama.cpp folds decoded output back into n_prompt_tokens while generating.
+    // Subtract n_decoded to recover the actual uncached prompt work.
+    const uncachedPromptTokens = Math.max(0, promptTokens - cachedPromptTokens - generatedTokens);
+    const active = slot.is_processing === true;
+    const phase =
+      active && processedPromptTokens < uncachedPromptTokens
+        ? "prompt"
+        : active
+          ? "generation"
+          : "idle";
+    const contextUsed = Math.min(contextLimit, promptTokens);
+    return {
+      active,
+      phase,
+      taskId: typeof slot.id_task === "number" ? slot.id_task : null,
+      context: {
+        used: contextUsed,
+        limit: contextLimit,
+        percent: contextLimit > 0 ? contextUsed / contextLimit : 0,
+      },
+      prompt: {
+        processed: Math.min(processedPromptTokens, uncachedPromptTokens),
+        total: uncachedPromptTokens,
+        cached: cachedPromptTokens,
+        percent:
+          uncachedPromptTokens > 0 ? Math.min(1, processedPromptTokens / uncachedPromptTokens) : 1,
+      },
+      generatedTokens,
+    };
+  }).pipe(Effect.catchCause(() => Effect.succeed(null)));
+}
+
+const LM_TOOLS_DELTA_METHODS = new Set([
+  "item/agentMessage/delta",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "item/commandExecution/outputDelta",
+]);
+
+function compactCampaignEvents(events: unknown[]): unknown[] {
+  const compacted: unknown[] = [];
+  const deltas = new Map<string, number>();
+  for (const candidate of events) {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+      compacted.push(candidate);
+      continue;
+    }
+    const event = candidate as Record<string, unknown>;
+    const params =
+      event.params !== null && typeof event.params === "object" && !Array.isArray(event.params)
+        ? (event.params as Record<string, unknown>)
+        : null;
+    const method = typeof event.method === "string" ? event.method : "";
+    const itemId = typeof params?.itemId === "string" ? params.itemId : null;
+    const delta = typeof params?.delta === "string" ? params.delta : null;
+    if (!LM_TOOLS_DELTA_METHODS.has(method) || !itemId || delta === null) {
+      compacted.push(candidate);
+      continue;
+    }
+    const key = `${method}:${itemId}`;
+    const existing = deltas.get(key);
+    if (existing === undefined) {
+      deltas.set(key, compacted.length);
+      compacted.push(candidate);
+      continue;
+    }
+    const previous = compacted[existing] as Record<string, unknown>;
+    const previousParams = previous.params as Record<string, unknown>;
+    compacted[existing] = {
+      ...previous,
+      params: { ...previousParams, delta: String(previousParams.delta ?? "") + delta },
+    };
+  }
+  return compacted.slice(-2000);
+}
+
+function readEventTail(fileSystem: FileSystem.FileSystem, path: string | undefined) {
+  if (!path) {
+    return Effect.succeed({
+      events: [] as unknown[],
+      lastEventAt: null,
+      bytes: 0,
+      lastEventMethod: null,
+    });
+  }
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const file = yield* fileSystem.open(path, { flag: "r" });
+      const stat = yield* file.stat;
+      const maximumLength = 16n * 1024n * 1024n;
+      const length = stat.size < maximumLength ? stat.size : maximumLength;
+      yield* file.seek(stat.size - length, "start");
+      const contents = yield* file.readAlloc(length);
+      const bytes = Option.getOrElse(contents, () => new Uint8Array());
+      const lines = new TextDecoder().decode(bytes).split("\n");
+      if (stat.size > length) lines.shift();
+      const rawEvents = lines.flatMap((line) => {
+        try {
+          return [JSON.parse(line) as unknown];
+        } catch {
+          return [];
+        }
+      });
+      const lastEvent = rawEvents.at(-1);
+      const lastEventMethod =
+        lastEvent !== null &&
+        typeof lastEvent === "object" &&
+        !Array.isArray(lastEvent) &&
+        typeof (lastEvent as Record<string, unknown>).method === "string"
+          ? ((lastEvent as Record<string, unknown>).method as string)
+          : null;
+      const events = compactCampaignEvents(rawEvents);
+      return {
+        events,
+        lastEventAt: Option.match(stat.mtime, {
+          onNone: () => null,
+          onSome: (modified) => modified.toISOString(),
+        }),
+        bytes: Number(stat.size),
+        lastEventMethod,
+      };
+    }),
+  ).pipe(
+    Effect.orElseSucceed(() => ({
+      events: [] as unknown[],
+      lastEventAt: null,
+      bytes: 0,
+      lastEventMethod: null,
+    })),
+  );
+}
+
+function readCampaignSnapshot(
+  fileSystem: FileSystem.FileSystem,
+  httpClient: HttpClient.HttpClient,
+) {
+  return Effect.gen(function* () {
+    const directory = process.env.LM_TOOLS_CAMPAIGN_DIR;
+    if (!directory) {
+      return {
+        configured: false,
+        campaign: null,
+        current: null,
+        events: [],
+      };
+    }
+    const [campaign, current, inference] = yield* Effect.all([
+      readOptionalJson(fileSystem, `${directory}/campaign.json`),
+      readOptionalJson(fileSystem, `${directory}/current.json`),
+      readModelInference(httpClient),
+    ]);
+    const eventLog =
+      current &&
+      typeof current === "object" &&
+      "eventLog" in current &&
+      typeof current.eventLog === "string"
+        ? current.eventLog
+        : undefined;
+    const tail = yield* readEventTail(fileSystem, eventLog);
+    return {
+      configured: true,
+      campaign,
+      current,
+      events: tail.events,
+      stream: {
+        lastEventAt: tail.lastEventAt,
+        bytes: tail.bytes,
+        lastEventMethod: tail.lastEventMethod,
+      },
+      inference,
+    };
+  });
+}
+
+export const lmToolsCampaignRouteLayer = HttpRouter.add(
+  "GET",
+  LM_TOOLS_CAMPAIGN_ROUTE,
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const httpClient = yield* HttpClient.HttpClient;
+    return HttpServerResponse.jsonUnsafe(yield* readCampaignSnapshot(fileSystem, httpClient));
+  }),
+);
+
+export const lmToolsCampaignEventsRouteLayer = HttpRouter.add(
+  "GET",
+  LM_TOOLS_CAMPAIGN_EVENTS_ROUTE,
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const httpClient = yield* HttpClient.HttpClient;
+    let eventLog: string | undefined;
+    let offset = 0n;
+    let pending = "";
+    let decoder = new TextDecoder();
+
+    const encode = (event: string, payload: unknown) =>
+      new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    const snapshot = readCampaignSnapshot(fileSystem, httpClient).pipe(
+      Effect.map((value) => {
+        const current = value.current;
+        eventLog =
+          current &&
+          typeof current === "object" &&
+          "eventLog" in current &&
+          typeof current.eventLog === "string"
+            ? current.eventLog
+            : undefined;
+        offset = BigInt(value.stream?.bytes ?? 0);
+        pending = "";
+        decoder = new TextDecoder();
+        return encode("snapshot", value);
+      }),
+    );
+    const readAppend = Effect.gen(function* () {
+      const directory = process.env.LM_TOOLS_CAMPAIGN_DIR;
+      if (!directory) return Option.none<Uint8Array>();
+      const current = yield* readOptionalJson(fileSystem, `${directory}/current.json`);
+      const nextEventLog =
+        current &&
+        typeof current === "object" &&
+        "eventLog" in current &&
+        typeof current.eventLog === "string"
+          ? current.eventLog
+          : undefined;
+      if (nextEventLog !== eventLog) return Option.some(yield* snapshot);
+      if (!eventLog) return Option.none<Uint8Array>();
+
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const file = yield* fileSystem.open(eventLog!, { flag: "r" });
+          const stat = yield* file.stat;
+          if (stat.size < offset) return Option.some(yield* snapshot);
+          if (stat.size === offset) return Option.none<Uint8Array>();
+          yield* file.seek(offset, "start");
+          const contents = yield* file.readAlloc(stat.size - offset);
+          offset = stat.size;
+          const bytes = Option.getOrElse(contents, () => new Uint8Array());
+          pending += decoder.decode(bytes, { stream: true });
+          const lines = pending.split("\n");
+          pending = lines.pop() ?? "";
+          const events = lines.flatMap((line) => {
+            try {
+              return [JSON.parse(line) as unknown];
+            } catch {
+              return [];
+            }
+          });
+          if (events.length === 0) return Option.none<Uint8Array>();
+          return Option.some(
+            encode("append", {
+              events,
+              stream: {
+                lastEventAt: Option.match(stat.mtime, {
+                  onNone: () => null,
+                  onSome: (modified) => modified.toISOString(),
+                }),
+                bytes: Number(stat.size),
+                lastEventMethod: (() => {
+                  const last = events.at(-1);
+                  return last !== null &&
+                    typeof last === "object" &&
+                    !Array.isArray(last) &&
+                    typeof (last as Record<string, unknown>).method === "string"
+                    ? (last as Record<string, unknown>).method
+                    : null;
+                })(),
+              },
+            }),
+          );
+        }),
+      ).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>()));
+    });
+
+    const snapshots = Stream.concat(
+      Stream.fromEffect(snapshot),
+      Stream.fromSchedule(Schedule.spaced("25 millis")).pipe(
+        Stream.mapEffect(() => readAppend),
+        Stream.filterMap((value) =>
+          Option.match(value, {
+            onNone: () => Result.failVoid,
+            onSome: Result.succeed,
+          }),
+        ),
+      ),
+    );
+    const inferenceUpdates = Stream.fromSchedule(Schedule.spaced("100 millis")).pipe(
+      Stream.mapEffect(() => readModelInference(httpClient)),
+      Stream.map((inference) => JSON.stringify(inference)),
+      Stream.changes,
+      Stream.map((inference) =>
+        encode("inference", { inference: JSON.parse(inference) as unknown }),
+      ),
+    );
+    return HttpServerResponse.stream(Stream.merge(snapshots, inferenceUpdates), {
+      headers: {
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "Content-Type": "text/event-stream",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }),
+);
 
 export function assetResponseHeaders(filePath: string): Record<string, string> {
   return {

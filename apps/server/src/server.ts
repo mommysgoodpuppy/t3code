@@ -17,6 +17,8 @@ import {
   staticAndDevRouteLayer,
   browserApiCorsLayer,
   httpCompressionLayer,
+  lmToolsCampaignRouteLayer,
+  lmToolsCampaignEventsRouteLayer,
 } from "./http.ts";
 import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
@@ -456,6 +458,8 @@ export const makeRoutesLayer = Layer.mergeAll(
     ),
     otlpTracesProxyRouteLayer,
     assetRouteLayer,
+    lmToolsCampaignRouteLayer,
+    lmToolsCampaignEventsRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),

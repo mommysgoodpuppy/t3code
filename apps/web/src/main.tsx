@@ -17,11 +17,10 @@ import {
 } from "./lib/windowControlsOverlay";
 import { AppRoot } from "./AppRoot";
 import { clerkAppearance } from "./components/clerk/clerkAppearance";
+import { LmToolsObserver } from "./components/LmToolsObserver";
 
 // Electron loads the app from a file-backed shell, so hash history avoids path resolution issues.
 const history = isElectron ? createHashHistory() : createBrowserHistory();
-
-const router = getRouter(history);
 
 if (isElectron) {
   syncDocumentElectronPlatformClasses(navigator.platform);
@@ -30,7 +29,8 @@ if (isElectron) {
 
 const clerkPublishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY as string | undefined;
 
-const app = <AppRoot router={router} />;
+const observerOnly = import.meta.env.VITE_LM_TOOLS_OBSERVER_ONLY === "1";
+const app = observerOnly ? <LmToolsObserver /> : <AppRoot router={getRouter(history)} />;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
