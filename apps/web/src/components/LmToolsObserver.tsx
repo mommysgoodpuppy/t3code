@@ -3,8 +3,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type JsonRecord = Record<string, unknown>;
 type ObserverResponse = {
   configured: boolean;
+  observer?: { kind: "campaign" | "proxy"; title: string };
   campaign: JsonRecord | null;
   current: JsonRecord | null;
+  summaries?: JsonRecord | null;
+  definition?: JsonRecord | null;
+  controller?: JsonRecord | null;
+  evaluations?: unknown[];
   events: JsonRecord[];
   stream?: { lastEventAt: string | null; bytes: number; lastEventMethod?: string | null };
   inference?: InferenceState | null;
@@ -23,7 +28,7 @@ type ObserverAppend = {
 };
 
 type TimelineEntry =
-  | { key: string; kind: "assistant" | "reasoning" | "error"; text: string }
+  | { key: string; kind: "user" | "assistant" | "reasoning" | "error"; text: string }
   | { key: string; kind: "plan"; items: Array<{ text: string; completed: boolean }> }
   | {
       key: string;
@@ -95,6 +100,32 @@ function compactCount(value: number): string {
   }).format(value);
 }
 
+function formatDuration(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  if (safe < 60) return `${safe}s`;
+  const minutes = Math.floor(safe / 60);
+  if (minutes < 60) return `${minutes}m ${safe % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function records(value: unknown): JsonRecord[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry) => (record(entry) ? [entry as JsonRecord] : []))
+    : [];
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+}
+
+function phaseDefinition(data: ObserverResponse, phaseName: string): JsonRecord | null {
+  const worker = record(data.definition?.worker);
+  return records(worker?.phases).find((phase) => phase.name === phaseName) ?? null;
+}
+
 function formatAge(timestamp: string | null | undefined, now: number): string {
   if (!timestamp) return "no events received";
   const ageSeconds = Math.max(0, Math.floor((now - Date.parse(timestamp)) / 1_000));
@@ -160,7 +191,7 @@ function timelineEntries(events: JsonRecord[]): TimelineEntry[] {
   const upsertText = (
     map: Map<string, number>,
     key: string,
-    kind: "assistant" | "reasoning",
+    kind: "user" | "assistant" | "reasoning",
     text: string,
     replace: boolean,
   ) => {
@@ -240,6 +271,10 @@ function timelineEntries(events: JsonRecord[]): TimelineEntry[] {
       if (text) upsertText(reasoning, id, "reasoning", text, method === "item/completed");
       continue;
     }
+    if (type === "usermessage" && typeof item.text === "string") {
+      upsertText(messages, id, "user", item.text, true);
+      continue;
+    }
     if (type === "agentmessage" && typeof item.text === "string") {
       upsertText(messages, id, "assistant", item.text, method === "item/completed");
       continue;
@@ -271,10 +306,11 @@ function timelineEntries(events: JsonRecord[]): TimelineEntry[] {
         : typeof item.aggregatedOutput === "string"
           ? item.aggregatedOutput
           : "";
+    const commandText = typeof item.command === "string" ? item.command : "";
     const command: TimelineEntry = {
       key: id,
       kind: "command",
-      command: String(item.command ?? "command"),
+      command: commandText || "tool invocation outside retained proxy trace",
       output: finalOutput,
       status: completed ? (exitCode === 0 ? "completed" : "failed") : "running",
       exitCode,
@@ -287,6 +323,7 @@ function timelineEntries(events: JsonRecord[]): TimelineEntry[] {
       const previous = entries[existing];
       entries[existing] = {
         ...command,
+        command: commandText || (previous?.kind === "command" ? previous.command : command.command),
         output: finalOutput || (previous?.kind === "command" ? previous.output : ""),
       };
     }
@@ -353,10 +390,21 @@ function useObserverStream() {
 
 export function LmToolsObserver() {
   const { data, connection } = useObserverStream();
+  const [view, setView] = useState<"live" | "history">("live");
   const entries = useMemo(() => timelineEntries(data.events), [data.events]);
   const usage = record(data.campaign?.usage);
+  // Proxy observers work for any agent whose traffic crosses the model proxy.
+  // Anything else is a campaign run.
+  const observerKind = data.observer?.kind;
+  const conversation = observerKind === "proxy";
+  const observerTitle = String(data.observer?.title ?? "Agent");
   const status = String(data.current?.status ?? "not started");
-  const running = status === "running" || status === "starting";
+  const paused = data.controller?.phase === "PAUSED" || status === "paused";
+  const running =
+    !paused &&
+    (status === "running" ||
+      status === "starting" ||
+      (conversation && data.inference?.active === true));
   const activeCommand = entries.some(
     (entry) => entry.kind === "command" && entry.status === "running",
   );
@@ -373,15 +421,26 @@ export function LmToolsObserver() {
       lastMethod === "item/commandExecution/outputDelta");
   const scroller = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
+  const phaseName = conversation && data.inference?.active
+    ? data.inference.phase
+    : paused
+    ? "paused"
+    : String(data.current?.phase ?? "between cycles").replace(":finalize", "");
+  const configuredPhase = phaseDefinition(data, phaseName);
+  const phaseTimeoutSeconds = number(configuredPhase?.timeoutSeconds);
+  const phaseStartedAt = String(data.current?.phaseStartedAt ?? "");
+  const phaseElapsedSeconds = phaseStartedAt
+    ? Math.max(0, (now - Date.parse(phaseStartedAt)) / 1_000)
+    : 0;
 
   useEffect(() => {
-    if (!following) return;
+    if (!following || view !== "live") return;
     const frame = window.requestAnimationFrame(() => {
       const element = scroller.current;
       if (element) element.scrollTop = element.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [entries.length, data.stream?.bytes, following]);
+  }, [entries.length, data.stream?.bytes, following, view]);
 
   const updateFollowing = () => {
     const element = scroller.current;
@@ -397,10 +456,12 @@ export function LmToolsObserver() {
   return (
     <main className="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground">
       <header className="border-b border-border/80 bg-background/95 px-4 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="truncate text-sm font-semibold">PS2 Linux autonomous agent</h1>
+              <h1 className="truncate text-sm font-semibold">
+                {data.observer?.title ?? "lm-tools agent observer"}
+              </h1>
               <ConnectionBadge connection={connection} />
             </div>
             <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
@@ -408,46 +469,141 @@ export function LmToolsObserver() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 text-xs">
-            <HeaderMetric label="Turns" value={String(number(data.campaign?.runs))} />
+            <HeaderMetric label={conversation ? "State" : "Stage"} value={phaseName} />
+            {!conversation ? <HeaderMetric label="Turns" value={String(number(data.campaign?.runs))} /> : null}
             <HeaderMetric label="Tokens" value={compactCount(number(usage?.totalTokens))} />
             <ContextMeter inference={data.inference} />
-            <span className={running ? "text-amber-400" : "text-emerald-400"}>
-              ● {running ? "run active" : status}
+            <span
+              className={paused ? "text-sky-300" : running ? "text-amber-400" : "text-emerald-400"}
+            >
+              ● {paused ? "paused · GPU released" : running ? (conversation ? "agent active" : "run active") : status}
             </span>
           </div>
         </div>
+        <div className="mx-auto mt-3 flex max-w-6xl items-end justify-between gap-4">
+          <nav className="flex rounded-lg bg-muted/50 p-1 text-xs">
+            <ViewButton active={view === "live"} onClick={() => setView("live")}>
+              Live stream
+            </ViewButton>
+            {!conversation ? (
+              <ViewButton active={view === "history"} onClick={() => setView("history")}>
+                Campaign map
+              </ViewButton>
+            ) : null}
+          </nav>
+          {!conversation ? (
+            <PhaseClock
+              phase={phaseName}
+              elapsedSeconds={phaseElapsedSeconds}
+              timeoutSeconds={phaseTimeoutSeconds}
+              running={running}
+            />
+          ) : null}
+        </div>
       </header>
 
-      <div ref={scroller} className="relative flex-1 overflow-y-auto" onScroll={updateFollowing}>
-        <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4 py-6 sm:px-8">
-          <TurnIntro current={data.current} />
-          {!data.configured ? (
-            <EmptyState />
-          ) : (
-            <div className="space-y-4">
-              {entries.map((entry) => (
-                <TimelineRow key={entry.key} entry={entry} />
-              ))}
-              {data.inference?.active && (data.inference.phase === "prompt" || !streamingDelta) ? (
-                <InferenceActivity inference={data.inference} />
-              ) : null}
-              {running && !activeCommand && !streamingDelta && !data.inference?.active ? (
-                <ActivityFooter lastEventAt={data.stream?.lastEventAt} now={now} />
-              ) : null}
-            </div>
-          )}
+      {view === "live" ? (
+        <div ref={scroller} className="relative flex-1 overflow-y-auto" onScroll={updateFollowing}>
+          <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4 py-6 sm:px-8">
+            {!conversation ? <TurnIntro current={data.current} phase={phaseName} /> : null}
+            {!data.configured ? (
+              <EmptyState conversation={conversation} />
+            ) : (
+              <div className="space-y-4">
+                {entries.map((entry) => (
+                  <TimelineRow key={entry.key} entry={entry} />
+                ))}
+                {data.inference?.active &&
+                !activeCommand &&
+                !streamingDelta &&
+                ((data.inference.phase === "prompt" && data.inference.prompt.processed > 0) ||
+                  (data.inference.phase === "generation" && data.inference.generatedTokens > 0)) ? (
+                  <InferenceActivity inference={data.inference} />
+                ) : null}
+                {running && !activeCommand && !streamingDelta && !data.inference?.active ? (
+                  <ActivityFooter
+                    lastEventAt={data.stream?.lastEventAt}
+                    now={now}
+                    source={conversation ? observerTitle : "Codex"}
+                  />
+                ) : null}
+              </div>
+            )}
+          </div>
+          {!following ? (
+            <button
+              type="button"
+              onClick={resumeFollowing}
+              className="sticky bottom-4 left-1/2 -translate-x-1/2 rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs shadow-lg backdrop-blur hover:bg-accent"
+            >
+              ↓ Follow live activity
+            </button>
+          ) : null}
         </div>
-        {!following ? (
-          <button
-            type="button"
-            onClick={resumeFollowing}
-            className="sticky bottom-4 left-1/2 -translate-x-1/2 rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs shadow-lg backdrop-blur hover:bg-accent"
-          >
-            ↓ Follow live activity
-          </button>
-        ) : null}
-      </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto">
+          <CampaignMap data={data} now={now} />
+        </div>
+      )}
     </main>
+  );
+}
+
+function ViewButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        active
+          ? "rounded-md bg-background px-3 py-1.5 font-medium shadow-sm"
+          : "rounded-md px-3 py-1.5 text-muted-foreground hover:text-foreground"
+      }
+    >
+      {children}
+    </button>
+  );
+}
+
+function PhaseClock({
+  phase,
+  elapsedSeconds,
+  timeoutSeconds,
+  running,
+}: {
+  phase: string;
+  elapsedSeconds: number;
+  timeoutSeconds: number;
+  running: boolean;
+}) {
+  const bounded = running && timeoutSeconds > 0;
+  const remaining = Math.max(0, timeoutSeconds - elapsedSeconds);
+  const percent = bounded ? Math.min(100, (elapsedSeconds / timeoutSeconds) * 100) : 0;
+  return (
+    <div className="w-64 max-w-[45vw]">
+      <div className="flex justify-between text-[10px] text-muted-foreground">
+        <span className="capitalize">{phase}</span>
+        <span className="font-mono">
+          {bounded
+            ? `${formatDuration(elapsedSeconds)} / ${formatDuration(timeoutSeconds)} · ${formatDuration(remaining)} left`
+            : "not timed"}
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className={percent > 85 ? "h-full bg-amber-400" : "h-full bg-sky-400"}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -531,16 +687,455 @@ function InferenceActivity({ inference }: { inference: InferenceState }) {
   );
 }
 
-function TurnIntro({ current }: { current: JsonRecord | null }) {
+function TurnIntro({ current, phase }: { current: JsonRecord | null; phase: string }) {
   return (
     <section className="mb-7 flex justify-end">
       <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-accent px-4 py-3 text-sm shadow-sm">
-        <p className="font-medium">Continue the PS2 Linux kernel investigation autonomously.</p>
+        <p className="font-medium">Continue the Qwen tinygrad campaign · {phase}</p>
         <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-          Handoff: {String(current?.prompt ?? "waiting")}
+          Phase prompt: {String(current?.prompt ?? "waiting")}
         </p>
       </div>
     </section>
+  );
+}
+
+function CampaignMap({ data, now }: { data: ObserverResponse; now: number }) {
+  const runs = records(data.campaign?.history);
+  const summaries = records(data.summaries?.entries);
+  const summariesByRun = new Map(
+    summaries.map((summary) => [String(summary.runId ?? ""), summary]),
+  );
+  const evaluations = records(data.evaluations);
+  const nodes = [
+    ...runs.flatMap((run, runIndex) => {
+      const phases = records(run.phases);
+      const displayed = phases.length > 0 ? phases : [{ name: "worker", ...run }];
+      return displayed.map((phase, phaseIndex) => ({
+        kind: "phase" as const,
+        run,
+        phase,
+        cycleIndex: runIndex + 1,
+        phaseIndex,
+        lastPhase: phaseIndex === displayed.length - 1,
+        time: Date.parse(String(phase.startedAt ?? run.startedAt ?? "")) || 0,
+      }));
+    }),
+    ...evaluations.map((value) => ({
+      kind: "evaluation" as const,
+      value,
+      time: Date.parse(String(value.startedAt ?? "")) || 0,
+    })),
+  ].sort((left, right) => left.time - right.time);
+  const controller = data.controller;
+  const accepted = record(controller?.accepted);
+  const phaseControl = record(record(data.definition?.worker)?.phaseControl);
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-8">
+      <section className="mb-7 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <HistoryMetric label="Completed cycles" value={String(runs.length)} />
+        <HistoryMetric label="Research summaries" value={String(summaries.length)} />
+        <HistoryMetric label="Evaluations" value={String(evaluations.length)} />
+        <HistoryMetric
+          label="Accepted candidate"
+          value={String(accepted?.hash ?? "baseline").slice(0, 10)}
+          mono
+        />
+        <HistoryMetric
+          label="Emergency ceiling"
+          value={`${formatDuration(number(phaseControl?.maxWallSeconds))} · ${number(phaseControl?.maxTransitions)} transitions`}
+        />
+      </section>
+
+      <div className="mb-5">
+        <h2 className="text-base font-semibold">Research trajectory</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Each phase is one separately budgeted agent session. A cycle spans one or more phases and
+          ends at a host evaluation boundary or worker failure.
+        </p>
+      </div>
+
+      <div className="relative ml-3 border-l border-border/80 pl-7">
+        {nodes.length === 0 ? <EmptyState /> : null}
+        <div className="space-y-2.5">
+          {nodes.map((node, index) =>
+            node.kind === "phase" ? (
+              <HistoryPhaseNode
+                key={`phase-${String(node.run.id ?? index)}-${node.phaseIndex}`}
+                run={node.run}
+                phase={node.phase}
+                summary={
+                  node.lastPhase
+                    ? (record(node.run.summary) ?? summariesByRun.get(String(node.run.id ?? "")))
+                    : undefined
+                }
+                cycleIndex={node.cycleIndex}
+                lastPhase={node.lastPhase}
+              />
+            ) : (
+              <EvaluationNode
+                key={`evaluation-${String(record(node.value.candidate)?.id ?? index)}`}
+                evaluation={node.value}
+              />
+            ),
+          )}
+          {data.current?.status === "running" ||
+          data.current?.status === "starting" ||
+          data.current?.status === "summarizing" ? (
+            <CurrentHistoryNode
+              current={data.current}
+              now={now}
+              phaseLimit={number(
+                phaseDefinition(data, String(data.current.phase ?? ""))?.timeoutSeconds,
+              )}
+            />
+          ) : data.controller?.phase === "PAUSED" || data.current?.status === "paused" ? (
+            <PausedHistoryNode current={data.current} />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HistoryMetric({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-card/50 px-3 py-2.5">
+      <div className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</div>
+      <div
+        className={mono ? "mt-1 truncate font-mono text-sm" : "mt-1 truncate text-sm font-medium"}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function TimelineDot({
+  tone = "default",
+}: {
+  tone?: "default" | "active" | "evaluation" | "failed";
+}) {
+  const color =
+    tone === "active"
+      ? "border-sky-400 bg-sky-400"
+      : tone === "evaluation"
+        ? "border-violet-400 bg-violet-400"
+        : tone === "failed"
+          ? "border-destructive bg-destructive"
+          : "border-emerald-400 bg-background";
+  return (
+    <span className={`absolute -left-[2.12rem] top-4 size-3 rounded-full border-2 ${color}`} />
+  );
+}
+
+function HistoryPhaseNode({
+  run,
+  phase,
+  summary,
+  cycleIndex,
+  lastPhase,
+}: {
+  run: JsonRecord;
+  phase: JsonRecord;
+  summary: JsonRecord | undefined;
+  cycleIndex: number;
+  lastPhase: boolean;
+}) {
+  const failed = number(phase.exitCode) !== 0;
+  const before = record(run.repositoriesBefore);
+  const after = record(run.repositoriesAfter);
+  const repositoryNames = [...new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})])];
+  return (
+    <article className="relative rounded-lg border border-border bg-card/35 px-3 py-2.5">
+      <TimelineDot tone={failed ? "failed" : "default"} />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-xs font-medium capitalize">{String(phase.name ?? "worker")}</span>
+          <span className="font-mono text-[9px] text-muted-foreground">Cycle {cycleIndex}</span>
+          {lastPhase ? (
+            <span
+              className={
+                number(run.exitCode) !== 0
+                  ? "rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] text-destructive"
+                  : "rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-400"
+              }
+            >
+              {number(run.exitCode) !== 0
+                ? run.timedOut
+                  ? "cycle timed out"
+                  : "cycle failed"
+                : "cycle completed"}
+            </span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2 font-mono text-[9px] text-muted-foreground">
+          <span>
+            {failed ? "×" : "●"} {formatDuration(number(phase.durationSeconds))}
+          </span>
+          {phase.finalizationAttempted ? <span>finalization used</span> : null}
+          {lastPhase ? (
+            <span>{compactCount(number(record(run.usage)?.totalTokens))} cycle tokens</span>
+          ) : null}
+        </div>
+      </div>
+
+      {summary ? (
+        <ResearchSummary summary={summary} />
+      ) : lastPhase && typeof run.finalMessage === "string" && run.finalMessage.trim() ? (
+        <details className="mt-2 rounded-md border border-border/70 bg-background/30">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium">
+            Cycle result summary
+          </summary>
+          <p className="whitespace-pre-wrap border-t border-border/60 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
+            {run.finalMessage.trim()}
+          </p>
+        </details>
+      ) : null}
+
+      {lastPhase && repositoryNames.length > 0 ? (
+        <details className="mt-2 rounded-lg border border-border/70 bg-background/30">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium">
+            Workspace changes
+          </summary>
+          <div className="space-y-3 border-t border-border/60 px-3 py-2.5">
+            {repositoryNames.map((name) => {
+              const beforeRepo = record(before?.[name]);
+              const afterRepo = record(after?.[name]);
+              const beforeStatus = String(beforeRepo?.status ?? "");
+              const afterStatus = String(afterRepo?.status ?? "");
+              return (
+                <div key={name}>
+                  <div className="flex justify-between gap-2 text-[10px]">
+                    <span className="truncate font-mono">{name}</span>
+                    <span
+                      className={
+                        beforeStatus === afterStatus ? "text-muted-foreground" : "text-amber-400"
+                      }
+                    >
+                      {beforeStatus === afterStatus ? "snapshot unchanged" : "changed during cycle"}
+                    </span>
+                  </div>
+                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-2 font-mono text-[10px] text-muted-foreground">
+                    {afterStatus || "clean"}
+                  </pre>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function ResearchSummary({ summary }: { summary: JsonRecord }) {
+  const evidence = strings(summary.evidence);
+  const changes = strings(summary.changes);
+  return (
+    <details className="mt-2 rounded-md border border-sky-400/20 bg-sky-500/[0.035]">
+      <summary className="cursor-pointer px-3 py-2">
+        <span className="text-xs font-medium">{String(summary.title ?? "Research summary")}</span>
+        <span className="ml-2 rounded-full bg-sky-500/10 px-2 py-0.5 text-[9px] uppercase tracking-wide text-sky-300">
+          {String(summary.status ?? "recorded")}
+        </span>
+      </summary>
+      <div className="space-y-4 border-t border-sky-400/15 px-3 py-3 text-xs leading-5">
+        <p className="whitespace-pre-wrap text-foreground/90">{String(summary.summary ?? "")}</p>
+        <div>
+          <div className="text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+            Outcome
+          </div>
+          <p className="mt-1 text-muted-foreground">{String(summary.outcome ?? "Not recorded")}</p>
+        </div>
+        {evidence.length > 0 ? (
+          <div>
+            <div className="text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+              Evidence retained
+            </div>
+            <ul className="mt-1 list-disc space-y-1 pl-4 text-muted-foreground">
+              {evidence.map((item, index) => (
+                <li key={`${item}-${index}`}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {changes.length > 0 ? (
+          <div>
+            <div className="text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+              Durable changes
+            </div>
+            <ul className="mt-1 list-disc space-y-1 pl-4 text-muted-foreground">
+              {changes.map((item, index) => (
+                <li key={`${item}-${index}`}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        <div className="rounded-md border border-border/60 bg-background/40 px-3 py-2">
+          <div className="text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+            Best next step
+          </div>
+          <p className="mt-1 text-foreground/90">{String(summary.nextStep ?? "Not recorded")}</p>
+        </div>
+        <div className="font-mono text-[9px] text-muted-foreground/70">
+          {String(summary.source ?? "campaign")} · {String(summary.generatedAt ?? "")}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function EvaluationNode({ evaluation }: { evaluation: JsonRecord }) {
+  const candidate = record(evaluation.candidate);
+  const request = record(evaluation.request);
+  const probe = record(evaluation.probe);
+  const profile = record(evaluation.profile);
+  const profileFamilies = records(profile?.families).slice(0, 3);
+  const tiers = records(evaluation.tiers);
+  const failed = typeof evaluation.failure === "string";
+  const retainedProfile = failed && profile !== null && number(profile.kernelCount) > 0;
+  const probeExecutionSucceeded = probe?.executionSucceeded ?? probe?.passed;
+  return (
+    <article className="relative rounded-lg border border-violet-400/25 bg-violet-500/[0.04] px-3 py-2.5">
+      <TimelineDot tone={failed ? "failed" : "evaluation"} />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-xs font-medium text-violet-300">
+            Host {String(request?.kind ?? "evaluation")}
+          </span>
+          <span className="truncate font-mono text-[9px] text-muted-foreground">
+            {String(candidate?.id ?? "candidate")}
+          </span>
+        </div>
+        <span
+          className={
+            evaluation.accepted
+              ? "rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-400"
+              : failed
+                ? "rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] text-destructive"
+                : "rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+          }
+        >
+          {evaluation.accepted
+            ? "accepted"
+            : retainedProfile
+              ? "profile retained · run faulted"
+              : failed
+                ? "failed"
+                : String(request?.kind ?? "benchmark")}
+        </span>
+      </div>
+      {profile ? (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[9px] text-muted-foreground">
+          <span className="font-mono">
+            {number(profile.kernelCount).toLocaleString()} kernels ·{" "}
+            {formatDuration(number(profile.kernelTimeMs) / 1000)} GPU time
+          </span>
+          {profileFamilies.map((family) => (
+            <span key={String(family.name)} className="rounded bg-violet-500/10 px-1.5 py-0.5">
+              {String(family.name)} {number(family.percentKernelTime).toFixed(1)}%
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {probe ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          Probe{" "}
+          <code>
+            {String(probe.runner)}:{String(probe.path)}
+          </code>{" "}
+          · {formatDuration(number(probe.wallMs) / 1000)} ·{" "}
+          {probeExecutionSucceeded ? "process completed" : "process failed"}
+        </p>
+      ) : null}
+      {tiers.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {tiers.map((tier) => (
+            <span
+              key={String(tier.name)}
+              className="rounded-md border border-border bg-background/50 px-2 py-1 font-mono text-[10px]"
+            >
+              {String(tier.name)} {formatDuration(number(tier.medianWallMs) / 1000)} ·{" "}
+              {number(tier.improvementPercent).toFixed(1)}%
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {failed ? (
+        <details className="mt-2 text-[10px] text-destructive">
+          <summary className="cursor-pointer">
+            {retainedProfile
+              ? "The diagnostic produced profile evidence but no valid model response"
+              : "Evaluation failure"}
+          </summary>
+          <p className="mt-1 font-mono">{String(evaluation.failure)}</p>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function CurrentHistoryNode({
+  current,
+  now,
+  phaseLimit,
+}: {
+  current: JsonRecord;
+  now: number;
+  phaseLimit: number;
+}) {
+  const cycleStarted = Date.parse(String(current.startedAt ?? ""));
+  const phaseStarted = Date.parse(String(current.phaseStartedAt ?? current.startedAt ?? ""));
+  const phaseElapsed = Number.isFinite(phaseStarted) ? (now - phaseStarted) / 1000 : 0;
+  return (
+    <article className="relative rounded-lg border border-sky-400/30 bg-sky-500/[0.04] px-3 py-2.5">
+      <TimelineDot tone="active" />
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-xs font-medium capitalize text-sky-300">
+            {String(current.phase ?? current.status ?? "starting")}
+          </span>
+          <span className="truncate font-mono text-[9px] text-muted-foreground">
+            Active cycle · {String(current.id ?? "starting")}
+          </span>
+        </div>
+        <span className="animate-pulse font-mono text-[10px] text-sky-300">
+          ● {formatDuration(phaseElapsed)}
+          {phaseLimit > 0 ? ` / ${formatDuration(phaseLimit)}` : ""}
+        </span>
+      </div>
+      <p className="mt-1 text-[10px] text-muted-foreground">
+        Cycle active for{" "}
+        {formatDuration(Number.isFinite(cycleStarted) ? (now - cycleStarted) / 1000 : 0)}. Live
+        Stream contains model inference, reasoning, and commands.
+      </p>
+    </article>
+  );
+}
+
+function PausedHistoryNode({ current }: { current: JsonRecord | null }) {
+  return (
+    <article className="relative rounded-lg border border-sky-400/30 bg-sky-500/[0.04] px-3 py-2.5">
+      <TimelineDot tone="active" />
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs font-medium text-sky-300">Campaign paused</span>
+        <span className="font-mono text-[9px] text-muted-foreground">GPU services stopped</span>
+      </div>
+      <p className="mt-1 text-[10px] text-muted-foreground">
+        Durable workspace state is preserved. Resume starts a fresh discovery phase.
+        {current?.pausedAt ? ` Paused at ${String(current.pausedAt)}.` : ""}
+      </p>
+    </article>
   );
 }
 
@@ -553,6 +1148,18 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
         <span className="mr-2 font-semibold">Error</span>
         {entry.text}
       </div>
+    );
+  }
+  if (entry.kind === "user") {
+    return (
+      <section className="flex justify-end">
+        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-accent px-4 py-3 text-sm shadow-sm">
+          <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            User
+          </div>
+          <p className="whitespace-pre-wrap leading-relaxed">{entry.text.trim()}</p>
+        </div>
+      </section>
     );
   }
   if (entry.kind === "reasoning") {
@@ -635,7 +1242,7 @@ function CommandCard({ command }: { command: Extract<TimelineEntry, { kind: "com
               ? `Command failed · exit ${command.exitCode ?? "?"}`
               : "Command completed"}
         </span>
-        <code className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+        <code className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted-foreground">
           {command.command}
         </code>
         <span className="text-[10px] text-muted-foreground">{expanded ? "▾" : "▸"}</span>
@@ -643,7 +1250,7 @@ function CommandCard({ command }: { command: Extract<TimelineEntry, { kind: "com
       {expanded ? (
         <div className="border-t border-border/70 bg-black/20">
           <div className="border-b border-border/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Shell
+            Invocation and output
           </div>
           <pre
             ref={outputScroller}
@@ -694,23 +1301,30 @@ function PlanCard({ items }: { items: Array<{ text: string; completed: boolean }
 function ActivityFooter({
   lastEventAt,
   now,
+  source = "Codex",
 }: {
   lastEventAt: string | null | undefined;
   now: number;
+  source?: string;
 }) {
   return (
     <div className="flex items-center gap-2 border-t border-border/50 py-3 text-[11px] text-muted-foreground">
       <span className="size-1.5 rounded-full bg-muted-foreground/50" />
-      No active streamed operation · waiting for the next Codex event · last event{" "}
+      No active streamed operation · waiting for the next {source} event · last event{" "}
       {formatAge(lastEventAt, now)}
     </div>
   );
 }
 
-function EmptyState() {
+function EmptyState({ conversation = false, label = "the agent" }: {
+  conversation?: boolean;
+  label?: string;
+}) {
   return (
     <div className="m-auto rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
-      Waiting for an lm-tools campaign stream…
+      {conversation
+        ? `Waiting for the ${label} session…`
+        : "Waiting for an lm-tools campaign stream…"}
     </div>
   );
 }

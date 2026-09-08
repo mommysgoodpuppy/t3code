@@ -50,6 +50,42 @@ const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inlin
 const LM_TOOLS_CAMPAIGN_ROUTE = "/api/lm-tools/campaign";
 const LM_TOOLS_CAMPAIGN_EVENTS_ROUTE = "/api/lm-tools/campaign/events";
 
+type JsonRecord = Record<string, unknown>;
+type LmToolsObserverSnapshot = {
+  configured: boolean;
+  observer?: { kind: string; title: string };
+  campaign: unknown;
+  current: unknown;
+  summaries?: unknown;
+  definition?: unknown;
+  controller?: unknown;
+  evaluations?: unknown[];
+  events: unknown[];
+  stream?: { lastEventAt: string | null; bytes: number; lastEventMethod: string | null };
+  inference?: unknown;
+};
+
+function jsonRecord(value: unknown): JsonRecord | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : null;
+}
+
+function redactCommand(value: string): string {
+  const secretName = "(?:password|passwd|token|api[_-]?key|secret)";
+  return value
+    .replace(
+      new RegExp(`(["']${secretName}["']\\s*:\\s*)["'][^"']*["']`, "gi"),
+      '$1"***"',
+    )
+    .replace(
+      new RegExp(`(\\b${secretName}\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s;]+)`, "gi"),
+      "$1***",
+    )
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/gi, "$1***")
+    .replace(/(https?:\/\/[^\s/:@]+:)[^\s/@]+@/gi, "$1***@");
+}
+
 function readOptionalJson(fileSystem: FileSystem.FileSystem, path: string) {
   return fileSystem.readFileString(path).pipe(
     Effect.map((contents) => JSON.parse(contents) as unknown),
@@ -57,7 +93,204 @@ function readOptionalJson(fileSystem: FileSystem.FileSystem, path: string) {
   );
 }
 
+function readEvaluationHistory(fileSystem: FileSystem.FileSystem) {
+  const directory = process.env.LM_TOOLS_CAMPAIGN_CANDIDATES_DIR;
+  if (!directory) return Effect.succeed([] as unknown[]);
+  return fileSystem.readDirectory(directory, { recursive: false }).pipe(
+    Effect.flatMap((entries) =>
+      Effect.all(
+        entries.map((entry) =>
+          readOptionalJson(fileSystem, `${directory}/${entry}/results/evaluation.json`),
+        ),
+        { concurrency: 8 },
+      ),
+    ),
+    Effect.map((entries) =>
+      entries
+        .filter((entry) => entry !== null)
+        .sort((left, right) => {
+          const timestamp = (value: unknown) =>
+            value !== null &&
+            typeof value === "object" &&
+            !Array.isArray(value) &&
+            "startedAt" in value &&
+            typeof value.startedAt === "string"
+              ? Date.parse(value.startedAt)
+              : 0;
+          return timestamp(left) - timestamp(right);
+        })
+        .slice(-100),
+    ),
+    Effect.orElseSucceed(() => [] as unknown[]),
+  );
+}
+
+/**
+ * Reads authoritative inference state from lm-tools proxies.
+ *
+ * Two proxies front the same llama.cpp process and each holds half the answer:
+ * the stack that spawned llama owns its stderr and therefore the cumulative
+ * prompt-eval fraction, while the per-environment proxy sees the billed usage
+ * for that environment's own traffic. Merge whichever fields each reports.
+ * Falls back to `/slots` when no proxy answers.
+ */
+function readProxyInference(httpClient: HttpClient.HttpClient) {
+  return Effect.gen(function* () {
+    const configured = (process.env.LM_TOOLS_INFERENCE_URL ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (configured.length === 0) return null;
+    const snapshots: Record<string, unknown>[] = [];
+    for (const base of configured) {
+      const snapshot = yield* httpClient
+        .get(new URL("/lm-tools/inference", base).toString())
+        .pipe(
+          Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.flatMap((response) => response.json),
+          Effect.timeout("750 millis"),
+          Effect.orElseSucceed(() => null as unknown),
+        );
+      if (snapshot !== null && typeof snapshot === "object" && !Array.isArray(snapshot)) {
+        snapshots.push(snapshot as Record<string, unknown>);
+      }
+    }
+    if (snapshots.length === 0) return null;
+    // Prompt evaluation is reported by whichever proxy owns llama's stderr.
+    const prompting = snapshots.find((entry) => entry.phase === "prompt");
+    // Context usage comes from the proxy that billed this environment's turn.
+    // A proxy that has not yet seen a completed turn reports used=0; that is an
+    // absence of data, not a measurement, so let llama's live slot fill it in.
+    const withContext = snapshots.find((entry) => {
+      const value = entry.context;
+      if (value === null || typeof value !== "object") return false;
+      const used = (value as Record<string, unknown>).used;
+      return typeof used === "number" && used > 0;
+    });
+    const generating = snapshots.find((entry) => entry.phase === "generation");
+    const first = snapshots[0];
+    if (first === undefined) return null;
+    const primary = prompting ?? generating ?? withContext ?? first;
+    // The renderer reads these fields unconditionally, so never hand it a
+    // partially shaped payload: a missing counter must render as zero, not
+    // crash the observer.
+    const num = (value: unknown): number =>
+      typeof value === "number" && Number.isFinite(value) ? value : 0;
+    const promptSource = (prompting ?? primary).prompt;
+    const prompt = promptSource !== null && typeof promptSource === "object"
+      ? (promptSource as Record<string, unknown>)
+      : {};
+    const contextSource = withContext?.context;
+    const context = contextSource !== null && typeof contextSource === "object"
+      ? (contextSource as Record<string, unknown>)
+      : null;
+    return {
+      ...primary,
+      active: snapshots.some((entry) => entry.active === true),
+      phase: prompting ? "prompt" : generating ? "generation" : "idle",
+      taskId: primary.taskId ?? null,
+      prompt: {
+        processed: num(prompt.processed),
+        total: num(prompt.total),
+        cached: num(prompt.cached),
+        percent: num(prompt.percent),
+      },
+      context: context
+        ? {
+          used: num(context.used),
+          limit: num(context.limit),
+          percent: num(context.percent),
+        }
+        : null,
+    };
+  }).pipe(Effect.catchCause(() => Effect.succeed(null)));
+}
+
+/**
+ * Coerces a merged snapshot into exactly the shape the observer renders.
+ *
+ * The renderer reads every field unconditionally (`context.limit`,
+ * `generatedTokens.toLocaleString()`, ...), so a missing key is a crash, not a
+ * blank. Normalizing on the single return path keeps that impossible.
+ */
+function normalizeInference(value: Record<string, unknown> | null): {
+  active: boolean;
+  phase: "prompt" | "generation" | "idle";
+  taskId: number | null;
+  context: { used: number; limit: number; percent: number };
+  prompt: { processed: number; total: number; cached: number; percent: number };
+  generatedTokens: number;
+} | null {
+  if (value === null) return null;
+  const num = (input: unknown): number =>
+    typeof input === "number" && Number.isFinite(input) ? input : 0;
+  const record = (input: unknown): Record<string, unknown> =>
+    input !== null && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const prompt = record(value.prompt);
+  const context = record(value.context);
+  const phase = value.phase === "prompt" || value.phase === "generation" ? value.phase : "idle";
+  return {
+    active: value.active === true,
+    phase,
+    taskId: typeof value.taskId === "number" ? value.taskId : null,
+    context: {
+      used: num(context.used),
+      limit: num(context.limit),
+      percent: num(context.percent),
+    },
+    prompt: {
+      processed: num(prompt.processed),
+      total: num(prompt.total),
+      cached: num(prompt.cached),
+      percent: num(prompt.percent),
+    },
+    generatedTokens: num(value.generatedTokens),
+  };
+}
+
 function readModelInference(httpClient: HttpClient.HttpClient) {
+  return Effect.gen(function* () {
+    const fromProxy = yield* readProxyInference(httpClient);
+    // The proxies hold the authoritative numbers but only after a turn has run.
+    // llama's slot is always live, so it backfills whatever they cannot answer
+    // yet -- notably context usage across a proxy restart.
+    const fromSlots = yield* readSlotInference(httpClient);
+    if (fromProxy === null) return normalizeInference(fromSlots);
+    // The stderr scraper latches the last progress line and is only reset by
+    // traffic through its own proxy, so a per-environment proxy's turns leave it
+    // reporting a finished evaluation forever. llama's slot is the liveness
+    // authority: if nothing is evaluating there, nothing is evaluating.
+    const slotIsPrompting = fromSlots?.phase === "prompt";
+    const merged = fromProxy.phase === "prompt" && !slotIsPrompting
+      ? {
+        ...fromProxy,
+        active: fromSlots?.active ?? false,
+        phase: fromSlots?.phase ?? "idle",
+        prompt: fromSlots?.prompt ?? fromProxy.prompt,
+      }
+      : fromProxy;
+    // Slot state backfills anything the proxies cannot answer yet: context usage
+    // before a turn completes, and generated-token counts, which only llama has.
+    // Cache hits are known to llama immediately but only reach the proxy with
+    // end-of-turn usage, so prefer the live slot while a turn is in flight.
+    const mergedPrompt = merged.prompt as Record<string, unknown> | undefined;
+    const slotCached = fromSlots?.prompt?.cached ?? 0;
+    const withGenerated = {
+      generatedTokens: fromSlots?.generatedTokens ?? 0,
+      ...merged,
+      ...(mergedPrompt && !(typeof mergedPrompt.cached === "number" && mergedPrompt.cached > 0) &&
+          slotCached > 0
+        ? { prompt: { ...mergedPrompt, cached: slotCached } }
+        : {}),
+    };
+    if (merged.context !== null || fromSlots === null) return normalizeInference(withGenerated);
+    return normalizeInference({ ...withGenerated, context: fromSlots.context });
+  }).pipe(Effect.catchCause(() => Effect.succeed(null)));
+}
+
+function readSlotInference(httpClient: HttpClient.HttpClient) {
   return Effect.gen(function* () {
     const modelUrl = process.env.LM_TOOLS_MODEL_URL;
     if (!modelUrl) return null;
@@ -89,12 +322,11 @@ function readModelInference(httpClient: HttpClient.HttpClient) {
     // Subtract n_decoded to recover the actual uncached prompt work.
     const uncachedPromptTokens = Math.max(0, promptTokens - cachedPromptTokens - generatedTokens);
     const active = slot.is_processing === true;
-    const phase =
-      active && processedPromptTokens < uncachedPromptTokens
-        ? "prompt"
-        : active
-          ? "generation"
-          : "idle";
+    // n_prompt_tokens and n_prompt_tokens_processed are not an atomic snapshot:
+    // llama.cpp updates them while decoded output is folded back into the slot.
+    // Once this task has decoded a token it cannot return to prompt evaluation,
+    // so n_decoded is the stable phase boundary.
+    const phase = active ? (generatedTokens > 0 ? "generation" : "prompt") : "idle";
     const contextUsed = Math.min(contextLimit, promptTokens);
     return {
       active,
@@ -217,10 +449,90 @@ function readEventTail(fileSystem: FileSystem.FileSystem, path: string | undefin
   );
 }
 
-function readCampaignSnapshot(
+function readProxyTraceTail(fileSystem: FileSystem.FileSystem) {
+  return readEventTail(fileSystem, process.env.LM_TOOLS_PROXY_TRACE).pipe(
+    Effect.map((tail) => {
+      const events = tail.events.flatMap((candidate) => {
+        const record = jsonRecord(candidate);
+        const event = jsonRecord(record?.event);
+        if (!event) return [];
+        const item = jsonRecord(event.item);
+        return [{
+          ...event,
+          ...(item && typeof item.command === "string"
+            ? { item: { ...item, command: redactCommand(item.command) } }
+            : {}),
+        }];
+      });
+      const lastEvent = events.at(-1);
+      return {
+        ...tail,
+        events: compactCampaignEvents(events),
+        lastEventMethod: typeof jsonRecord(lastEvent)?.method === "string"
+          ? jsonRecord(lastEvent)?.method as string
+          : null,
+      };
+    }),
+  );
+}
+
+/**
+ * Agent-agnostic observer: everything rendered here already crosses the model
+ * proxy, so the snapshot is built from the proxy trace plus live inference
+ * state. No per-agent gateway API, and nothing to reimplement when the agent
+ * on top changes.
+ */
+function readProxySnapshot(
   fileSystem: FileSystem.FileSystem,
   httpClient: HttpClient.HttpClient,
 ) {
+  return Effect.gen(function* () {
+    const title = process.env.LM_TOOLS_OBSERVER_TITLE ?? "Agent";
+    const [inference, proxyTrace] = yield* Effect.all([
+      readModelInference(httpClient),
+      readProxyTraceTail(fileSystem),
+    ]);
+    const active = inference?.active === true;
+    return {
+      configured: true,
+      observer: { kind: "proxy", title },
+      campaign: null,
+      current: {
+        id: title,
+        phase: "conversation",
+        status: active ? "running" : "idle",
+      },
+      events: proxyTrace.events,
+      stream: {
+        lastEventAt: proxyTrace.lastEventAt,
+        bytes: proxyTrace.bytes,
+        lastEventMethod: proxyTrace.lastEventMethod,
+      },
+      inference,
+    };
+  }).pipe(
+    Effect.catchCause(() =>
+      Effect.succeed({
+        configured: false,
+        observer: { kind: "proxy", title: process.env.LM_TOOLS_OBSERVER_TITLE ?? "Agent" },
+        campaign: null,
+        current: null,
+        events: [],
+      })
+    ),
+  );
+}
+
+function readCampaignSnapshot(
+  fileSystem: FileSystem.FileSystem,
+  httpClient: HttpClient.HttpClient,
+): Effect.Effect<LmToolsObserverSnapshot> {
+
+  if (process.env.LM_TOOLS_OBSERVER_SOURCE === "proxy") {
+    return readProxySnapshot(fileSystem, httpClient).pipe(
+      Effect.map((snapshot) => snapshot as LmToolsObserverSnapshot),
+    );
+  }
   return Effect.gen(function* () {
     const directory = process.env.LM_TOOLS_CAMPAIGN_DIR;
     if (!directory) {
@@ -231,11 +543,20 @@ function readCampaignSnapshot(
         events: [],
       };
     }
-    const [campaign, current, inference] = yield* Effect.all([
-      readOptionalJson(fileSystem, `${directory}/campaign.json`),
-      readOptionalJson(fileSystem, `${directory}/current.json`),
-      readModelInference(httpClient),
-    ]);
+    const [campaign, current, summaries, inference, definition, controller, evaluations] =
+      yield* Effect.all([
+        readOptionalJson(fileSystem, `${directory}/campaign.json`),
+        readOptionalJson(fileSystem, `${directory}/current.json`),
+        readOptionalJson(fileSystem, `${directory}/summaries.json`),
+        readModelInference(httpClient),
+        process.env.LM_TOOLS_ENVIRONMENT_CONFIG
+          ? readOptionalJson(fileSystem, process.env.LM_TOOLS_ENVIRONMENT_CONFIG)
+          : Effect.succeed(null),
+        process.env.LM_TOOLS_CAMPAIGN_JOURNAL
+          ? readOptionalJson(fileSystem, process.env.LM_TOOLS_CAMPAIGN_JOURNAL)
+          : Effect.succeed(null),
+        readEvaluationHistory(fileSystem),
+      ]);
     const eventLog =
       current &&
       typeof current === "object" &&
@@ -246,8 +567,13 @@ function readCampaignSnapshot(
     const tail = yield* readEventTail(fileSystem, eventLog);
     return {
       configured: true,
+      observer: { kind: "campaign", title: "Qwen tinygrad optimization campaign" },
       campaign,
       current,
+      summaries,
+      definition,
+      controller,
+      evaluations,
       events: tail.events,
       stream: {
         lastEventAt: tail.lastEventAt,
@@ -256,7 +582,7 @@ function readCampaignSnapshot(
       },
       inference,
     };
-  });
+  }).pipe(Effect.map((snapshot) => snapshot as LmToolsObserverSnapshot));
 }
 
 export const lmToolsCampaignRouteLayer = HttpRouter.add(
@@ -358,18 +684,28 @@ export const lmToolsCampaignEventsRouteLayer = HttpRouter.add(
       ).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>()));
     });
 
-    const snapshots = Stream.concat(
-      Stream.fromEffect(snapshot),
-      Stream.fromSchedule(Schedule.spaced("25 millis")).pipe(
-        Stream.mapEffect(() => readAppend),
-        Stream.filterMap((value) =>
-          Option.match(value, {
-            onNone: () => Result.failVoid,
-            onSome: Result.succeed,
-          }),
+    const snapshots = process.env.LM_TOOLS_OBSERVER_SOURCE === "proxy"
+      ? Stream.concat(
+        Stream.fromEffect(snapshot),
+        Stream.fromSchedule(Schedule.spaced("1 second")).pipe(
+          Stream.mapEffect(() => readCampaignSnapshot(fileSystem, httpClient)),
+          Stream.map((value) => JSON.stringify(value)),
+          Stream.changes,
+          Stream.map((value) => encode("snapshot", JSON.parse(value) as unknown)),
         ),
-      ),
-    );
+      )
+      : Stream.concat(
+        Stream.fromEffect(snapshot),
+        Stream.fromSchedule(Schedule.spaced("25 millis")).pipe(
+          Stream.mapEffect(() => readAppend),
+          Stream.filterMap((value) =>
+            Option.match(value, {
+              onNone: () => Result.failVoid,
+              onSome: Result.succeed,
+            }),
+          ),
+        ),
+      );
     const inferenceUpdates = Stream.fromSchedule(Schedule.spaced("100 millis")).pipe(
       Stream.mapEffect(() => readModelInference(httpClient)),
       Stream.map((inference) => JSON.stringify(inference)),
