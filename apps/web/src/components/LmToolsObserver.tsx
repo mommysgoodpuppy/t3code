@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type JsonRecord = Record<string, unknown>;
 type ObserverResponse = {
   configured: boolean;
-  observer?: { kind: "campaign" | "proxy"; title: string };
+  observer?: { kind: "campaign" | "proxy" | "free-router"; title: string };
   campaign: JsonRecord | null;
   current: JsonRecord | null;
   summaries?: JsonRecord | null;
@@ -13,6 +13,9 @@ type ObserverResponse = {
   events: JsonRecord[];
   stream?: { lastEventAt: string | null; bytes: number; lastEventMethod?: string | null };
   inference?: InferenceState | null;
+  router?: JsonRecord | null;
+  requests?: JsonRecord[];
+  retention?: JsonRecord | null;
 };
 type InferenceState = {
   active: boolean;
@@ -38,6 +41,16 @@ type TimelineEntry =
       status: "running" | "completed" | "failed";
       exitCode: number | null;
     };
+
+type RouterConversation = {
+  id: string;
+  source: string;
+  label?: string;
+  requests: JsonRecord[];
+  updatedAt: string;
+  active: boolean;
+  totalTokens: number;
+};
 
 const EMPTY: ObserverResponse = {
   configured: false,
@@ -119,6 +132,54 @@ function strings(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === "string")
     : [];
+}
+
+function routerConversations(requests: JsonRecord[]): RouterConversation[] {
+  const grouped = new Map<string, RouterConversation>();
+  for (const request of requests) {
+    const id = String(request.conversationId ?? "unattributed");
+    const source = String(request.conversationSource ?? "agent");
+    const label = typeof request.conversationLabel === "string" ? request.conversationLabel : "";
+    const status = String(request.status ?? "routing");
+    const updatedAt = String(request.updatedAt ?? request.startedAt ?? "");
+    const usage = record(request.usage);
+    const totalTokens = number(
+      usage?.total_tokens ??
+        number(usage?.prompt_tokens ?? usage?.input_tokens) +
+          number(usage?.completion_tokens ?? usage?.output_tokens),
+    );
+    const existing = grouped.get(id);
+    if (existing) {
+      existing.requests.push(request);
+      if (Date.parse(updatedAt) > Date.parse(existing.updatedAt)) existing.updatedAt = updatedAt;
+      existing.active ||= status === "routing" || status === "streaming";
+      existing.totalTokens += totalTokens;
+      continue;
+    }
+    grouped.set(id, {
+      id,
+      source,
+      ...(label ? { label } : {}),
+      requests: [request],
+      updatedAt,
+      active: status === "routing" || status === "streaming",
+      totalTokens,
+    });
+  }
+  return [...grouped.values()].sort(
+    (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+  );
+}
+
+function conversationLabel(conversation: RouterConversation): string {
+  if (conversation.label) return conversation.label;
+  const source = conversation.source
+    .split(/[-_]/g)
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+  if (conversation.id === "unattributed") return `${source || "Agent"} · earlier requests`;
+  return `${source || "Agent"} · ${conversation.id.slice(-6)}`;
 }
 
 function phaseDefinition(data: ObserverResponse, phaseName: string): JsonRecord | null {
@@ -396,7 +457,17 @@ export function LmToolsObserver() {
   // Proxy observers work for any agent whose traffic crosses the model proxy.
   // Anything else is a campaign run.
   const observerKind = data.observer?.kind;
-  const conversation = observerKind === "proxy";
+  const freeRouter = observerKind === "free-router";
+  const conversation = observerKind === "proxy" || freeRouter;
+  const routerRequests = records(data.requests);
+  const conversations = useMemo(() => routerConversations(routerRequests), [data.requests]);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const selectedConversation =
+    conversations.find((candidate) => candidate.id === selectedConversationId) ?? conversations[0];
+  const [conversationRequests, setConversationRequests] = useState<Record<string, JsonRecord[]>>(
+    {},
+  );
+  const [conversationLoadError, setConversationLoadError] = useState<string | null>(null);
   const observerTitle = String(data.observer?.title ?? "Agent");
   const status = String(data.current?.status ?? "not started");
   const paused = data.controller?.phase === "PAUSED" || status === "paused";
@@ -421,11 +492,12 @@ export function LmToolsObserver() {
       lastMethod === "item/commandExecution/outputDelta");
   const scroller = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
-  const phaseName = conversation && data.inference?.active
-    ? data.inference.phase
-    : paused
-    ? "paused"
-    : String(data.current?.phase ?? "between cycles").replace(":finalize", "");
+  const phaseName =
+    conversation && data.inference?.active
+      ? data.inference.phase
+      : paused
+        ? "paused"
+        : String(data.current?.phase ?? "between cycles").replace(":finalize", "");
   const configuredPhase = phaseDefinition(data, phaseName);
   const phaseTimeoutSeconds = number(configuredPhase?.timeoutSeconds);
   const phaseStartedAt = String(data.current?.phaseStartedAt ?? "");
@@ -434,13 +506,34 @@ export function LmToolsObserver() {
     : 0;
 
   useEffect(() => {
+    if (!freeRouter || !selectedConversation) return;
+    let cancelled = false;
+    const id = selectedConversation.id;
+    fetch(`/api/lm-tools/free-router/conversation?id=${encodeURIComponent(id)}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Conversation request failed: ${response.status}`);
+        const value = (await response.json()) as { requests?: unknown };
+        if (cancelled) return;
+        setConversationRequests((current) => ({ ...current, [id]: records(value.requests) }));
+        setConversationLoadError(null);
+      })
+      .catch((error) => {
+        if (!cancelled)
+          setConversationLoadError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [freeRouter, selectedConversation?.id, selectedConversation?.updatedAt]);
+
+  useEffect(() => {
     if (!following || view !== "live") return;
     const frame = window.requestAnimationFrame(() => {
       const element = scroller.current;
       if (element) element.scrollTop = element.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [entries.length, data.stream?.bytes, following, view]);
+  }, [entries.length, data.stream?.bytes, following, selectedConversation?.id, view]);
 
   const updateFollowing = () => {
     const element = scroller.current;
@@ -453,10 +546,22 @@ export function LmToolsObserver() {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
   };
 
+  if (!data.observer && connection !== "live") {
+    return (
+      <main className="fixed inset-0 flex items-center justify-center bg-background text-foreground">
+        <div className="text-center">
+          <div className="mx-auto size-2 animate-pulse rounded-full bg-amber-400" />
+          <p className="mt-3 text-sm font-medium">Loading observer…</p>
+          <p className="mt-1 text-xs text-muted-foreground">Waiting for the initial live index</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground">
       <header className="border-b border-border/80 bg-background/95 px-4 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 sm:gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <h1 className="truncate text-sm font-semibold">
@@ -468,15 +573,26 @@ export function LmToolsObserver() {
               {String(data.current?.id ?? "Waiting for a run")}
             </p>
           </div>
-          <div className="flex shrink-0 items-center gap-4 text-xs">
+          <div className="flex min-w-0 shrink-0 items-center gap-3 text-xs sm:gap-4">
             <HeaderMetric label={conversation ? "State" : "Stage"} value={phaseName} />
-            {!conversation ? <HeaderMetric label="Turns" value={String(number(data.campaign?.runs))} /> : null}
+            {!conversation ? (
+              <HeaderMetric label="Turns" value={String(number(data.campaign?.runs))} />
+            ) : null}
             <HeaderMetric label="Tokens" value={compactCount(number(usage?.totalTokens))} />
             <ContextMeter inference={data.inference} />
             <span
-              className={paused ? "text-sky-300" : running ? "text-amber-400" : "text-emerald-400"}
+              className={`whitespace-nowrap ${
+                paused ? "text-sky-300" : running ? "text-amber-400" : "text-emerald-400"
+              }`}
             >
-              ● {paused ? "paused · GPU released" : running ? (conversation ? "agent active" : "run active") : status}
+              ●{" "}
+              {paused
+                ? "paused · GPU released"
+                : running
+                  ? conversation
+                    ? "agent active"
+                    : "run active"
+                  : status}
             </span>
           </div>
         </div>
@@ -504,12 +620,32 @@ export function LmToolsObserver() {
 
       {view === "live" ? (
         <div ref={scroller} className="relative flex-1 overflow-y-auto" onScroll={updateFollowing}>
-          <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4 py-6 sm:px-8">
+          <div
+            className={`mx-auto flex min-h-full w-full flex-col px-4 py-6 sm:px-8 ${
+              freeRouter ? "max-w-6xl" : "max-w-4xl"
+            }`}
+          >
             {!conversation ? <TurnIntro current={data.current} phase={phaseName} /> : null}
             {!data.configured ? (
               <EmptyState conversation={conversation} />
             ) : (
               <div className="space-y-4">
+                {freeRouter ? (
+                  <RouterOverview router={data.router} retention={data.retention} />
+                ) : null}
+                {freeRouter ? (
+                  <RouterConversationBrowser
+                    conversations={conversations}
+                    selectedId={selectedConversation?.id ?? null}
+                    selectedRequests={
+                      selectedConversation
+                        ? conversationRequests[selectedConversation.id]
+                        : undefined
+                    }
+                    loadError={conversationLoadError}
+                    onSelect={setSelectedConversationId}
+                  />
+                ) : null}
                 {entries.map((entry) => (
                   <TimelineRow key={entry.key} entry={entry} />
                 ))}
@@ -520,7 +656,11 @@ export function LmToolsObserver() {
                   (data.inference.phase === "generation" && data.inference.generatedTokens > 0)) ? (
                   <InferenceActivity inference={data.inference} />
                 ) : null}
-                {running && !activeCommand && !streamingDelta && !data.inference?.active ? (
+                {running &&
+                !freeRouter &&
+                !activeCommand &&
+                !streamingDelta &&
+                !data.inference?.active ? (
                   <ActivityFooter
                     lastEventAt={data.stream?.lastEventAt}
                     now={now}
@@ -546,6 +686,545 @@ export function LmToolsObserver() {
         </div>
       )}
     </main>
+  );
+}
+
+function RouterOverview({
+  router,
+  retention,
+}: {
+  router: JsonRecord | null | undefined;
+  retention: JsonRecord | null | undefined;
+}) {
+  const routes = records(router?.routes);
+  const active = records(router?.active);
+  const failures = records(router?.recentFailures);
+  const lanes = [...new Set(routes.map((route) => String(route.publicModel ?? "default")))];
+  return (
+    <section className="rounded-xl border border-border bg-card/50 p-3 sm:p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-xs font-semibold">Free-router fabric</h2>
+          <p className="mt-0.5 text-[10px] text-muted-foreground">
+            {lanes.length} lanes · {routes.length} zero-cost routes · detailed private audit enabled
+          </p>
+        </div>
+        <span className={active.length > 0 ? "text-xs text-amber-400" : "text-xs text-emerald-400"}>
+          ● {active.length > 0 ? `${active.length} active` : "idle"}
+        </span>
+      </div>
+      {retention ? <AuditCoverage retention={retention} /> : null}
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        {lanes.map((lane) => {
+          const laneRoutes = routes.filter(
+            (route) => String(route.publicModel ?? "default") === lane,
+          );
+          return (
+            <div key={lane} className="rounded-lg border border-border/70 bg-background/35 p-2.5">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="font-mono text-[10px] font-semibold">{lane}</span>
+                <span className="text-[9px] text-muted-foreground">priority order</span>
+              </div>
+              <div className="space-y-1.5">
+                {laneRoutes.map((route) => (
+                  <div
+                    key={`${lane}-${String(route.id)}`}
+                    className="flex items-center gap-2 text-[10px]"
+                  >
+                    <span
+                      className={
+                        route.state === "ready"
+                          ? "size-1.5 rounded-full bg-emerald-400"
+                          : route.state === "cooldown"
+                            ? "size-1.5 rounded-full bg-amber-400"
+                            : "size-1.5 rounded-full bg-destructive"
+                      }
+                    />
+                    <span className="w-5 shrink-0 text-right font-mono text-muted-foreground">
+                      {String(route.priority ?? 0)}
+                    </span>
+                    <span className="truncate font-mono">
+                      {String(route.provider)}/{String(route.model)}
+                    </span>
+                    <span className="ml-auto text-muted-foreground">{String(route.state)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {failures.length > 0 ? (
+        <details className="mt-3 text-[10px] text-muted-foreground">
+          <summary className="cursor-pointer">Recent failovers ({failures.length})</summary>
+          <div className="mt-2 space-y-1 font-mono">
+            {failures.map((failure, index) => (
+              <div key={`${String(failure.at)}-${index}`}>
+                {String(failure.publicModel)} · {String(failure.provider)}/{String(failure.model)} ·{" "}
+                {String(failure.kind)}
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </section>
+  );
+}
+
+function AuditCoverage({ retention }: { retention: JsonRecord }) {
+  const excluded = strings(retention.excluded);
+  const journal = record(retention.journal);
+  const maximumRequests = number(retention.maximumRequests);
+  const maximumCharacters = number(retention.maximumApproximateCharacters);
+  const evicted = number(retention.evictedRequests);
+  return (
+    <div className="mt-3 rounded-lg border border-sky-400/20 bg-sky-400/5 px-3 py-2 text-[10px] text-muted-foreground">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="font-medium text-sky-200">Detailed audit capture</span>
+        <span className="font-mono">
+          up to {maximumRequests.toLocaleString()} requests · approximately{" "}
+          {compactCount(maximumCharacters)} characters
+        </span>
+      </div>
+      <p className="mt-1">
+        Complete model request bodies—including system, user, assistant, tool messages, and tool
+        definitions—and raw upstream response chunks are retained in router memory.{" "}
+        {String(retention.persistence ?? "")}
+      </p>
+      {journal?.enabled === true ? (
+        <div className="mt-1.5 rounded border border-border/60 bg-background/40 px-2 py-1.5 font-mono text-[9px]">
+          <div className="break-all text-foreground">{String(journal.path)}</div>
+          <div className="mt-0.5">
+            {compactCount(number(journal.bytes))} / {compactCount(number(journal.maximumBytes))}{" "}
+            bytes · {number(journal.recordsLoaded).toLocaleString()} recent records replayed
+          </div>
+          {number(journal.malformedRecords) > 0 ? (
+            <div className="mt-0.5 text-amber-300">
+              {number(journal.malformedRecords).toLocaleString()} malformed journal record
+              {number(journal.malformedRecords) === 1 ? "" : "s"} skipped during replay
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <p className="mt-1 font-medium text-amber-300">No durable journal is configured.</p>
+      )}
+      {evicted > 0 ? (
+        <p className="mt-1 font-medium text-amber-300">
+          {evicted.toLocaleString()} older request{evicted === 1 ? " has" : "s have"} left the live
+          projection; the append-only journal still retains {evicted === 1 ? "it" : "them"}.
+        </p>
+      ) : null}
+      {excluded.length > 0 ? (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-amber-200">
+            Not captured ({excluded.length})
+          </summary>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {excluded.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function RequestAudit({ request }: { request: JsonRecord }) {
+  const [expanded, setExpanded] = useState(false);
+  const [detail, setDetail] = useState<JsonRecord | null>(null);
+  const [detailState, setDetailState] = useState<"idle" | "loading" | "failed">("idle");
+  const effectiveRequest = detail ?? request;
+  const audit = record(request.audit);
+  const capture = record(effectiveRequest.capture) ?? {};
+  const requestBody = record(effectiveRequest.requestBody);
+  const messages = records(requestBody?.messages);
+  const responseChunks = Array.isArray(effectiveRequest.responseChunks)
+    ? effectiveRequest.responseChunks
+    : [];
+  const requestBodyState = String(capture.requestBody ?? "unavailable");
+  const responseState = String(capture.responseChunks ?? "unavailable");
+  const omitted = strings(capture.omitted);
+  const incomplete = [
+    requestBodyState,
+    responseState,
+    String(capture.latestUserMessage ?? "unavailable"),
+    String(capture.reasoning ?? "unavailable"),
+    String(capture.content ?? "unavailable"),
+  ].some((state) => state !== "complete");
+  const parameters = requestBody
+    ? Object.fromEntries(Object.entries(requestBody).filter(([key]) => key !== "messages"))
+    : null;
+  const messageCount = detail ? messages.length : number(audit?.messageCount);
+  const responseChunkCount = detail ? responseChunks.length : number(audit?.responseChunkCount);
+
+  const toggleAudit = async () => {
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (!nextExpanded || detail || detailState === "loading") return;
+    setDetailState("loading");
+    try {
+      const response = await fetch(
+        `/api/lm-tools/free-router/request?id=${encodeURIComponent(String(request.id))}`,
+      );
+      if (!response.ok) throw new Error(`Audit request failed: ${response.status}`);
+      setDetail((await response.json()) as JsonRecord);
+      setDetailState("idle");
+    } catch {
+      setDetailState("failed");
+    }
+  };
+
+  return (
+    <section className="border-t border-border/60 bg-background/30">
+      <button
+        type="button"
+        onClick={() => void toggleAudit()}
+        className="flex w-full flex-wrap items-center justify-between gap-2 px-3 py-2 text-left text-[10px] hover:bg-accent/30"
+        aria-expanded={expanded}
+      >
+        <span className="font-medium">
+          {expanded ? "▾" : "▸"} Request audit · {messageCount} message
+          {messageCount === 1 ? "" : "s"} · {responseChunkCount} response chunk
+          {responseChunkCount === 1 ? "" : "s"}
+        </span>
+        <span className={incomplete ? "font-mono text-amber-300" : "font-mono text-emerald-400"}>
+          {incomplete ? "capture has declared gaps" : "complete capture"}
+        </span>
+      </button>
+      {expanded ? (
+        <div className="space-y-3 border-t border-border/50 p-3">
+          {detailState === "loading" && !detail ? (
+            <div className="animate-pulse text-[10px] text-muted-foreground">
+              Loading full audit record…
+            </div>
+          ) : null}
+          {detailState === "failed" && !detail ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-2.5 text-[10px] text-destructive">
+              Full audit record could not be loaded. The summary remains visible.
+            </div>
+          ) : null}
+          {requestBody ? (
+            <>
+              <AuditJson label="Request parameters and tool definitions" value={parameters} />
+              <div>
+                <h3 className="mb-1.5 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Submitted message history
+                </h3>
+                <div className="space-y-2">
+                  {messages.map((message, index) => (
+                    <div
+                      key={String(message.role) + "-" + index}
+                      className="rounded-lg border border-border/60 bg-background/60"
+                    >
+                      <div className="border-b border-border/50 px-2.5 py-1.5 text-[9px] font-medium uppercase tracking-wider text-sky-300">
+                        {String(message.role ?? "unknown")} · message {index + 1}
+                      </div>
+                      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[10px] leading-4">
+                        {prettyJson(message)}
+                      </pre>
+                    </div>
+                  ))}
+                  {messages.length === 0 ? (
+                    <p className="text-[10px] text-muted-foreground">
+                      The submitted message array was empty.
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            </>
+          ) : detailState !== "loading" ? (
+            <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-2.5 text-[10px] text-amber-200">
+              Request body is unavailable in the loaded audit record.
+            </div>
+          ) : null}
+          {detail ? (
+            <AuditJson
+              label={"Raw upstream response chunks · " + responseState}
+              value={responseChunks}
+            />
+          ) : null}
+          {incomplete ? (
+            <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-2.5 font-mono text-[10px] text-amber-200">
+              request={requestBodyState} · response chunks={responseState} · reasoning=
+              {String(capture.reasoning ?? "unavailable")} · answer=
+              {String(capture.content ?? "unavailable")} · latest user preview=
+              {String(capture.latestUserMessage ?? "unavailable")}
+            </div>
+          ) : null}
+          {omitted.length > 0 ? (
+            <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-2.5 text-[10px] text-amber-200">
+              <div className="font-medium">Unavailable in this historical source:</div>
+              <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                {omitted.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function AuditJson({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div>
+      <h3 className="mb-1.5 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </h3>
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/60 bg-background/60 p-2.5 font-mono text-[10px] leading-4">
+        {prettyJson(value)}
+      </pre>
+    </div>
+  );
+}
+
+function prettyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "[value could not be rendered as JSON]";
+  }
+}
+
+function RouterRequestCard({ request }: { request: JsonRecord }) {
+  const routes = records(request.routes);
+  const committed = [...routes]
+    .reverse()
+    .find((route) => route.type === "committed" || route.type === "imported");
+  const usage = record(request.usage);
+  const reasoning = String(request.reasoning ?? "");
+  const content = String(request.content ?? "");
+  const status = String(request.status ?? "routing");
+  const active = status === "routing" || status === "streaming";
+  return (
+    <article className="overflow-hidden rounded-xl border border-border bg-card/40">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/70 px-3 py-2.5">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-xs">
+            <span
+              className={
+                active
+                  ? "size-2 animate-pulse rounded-full bg-amber-400"
+                  : status === "failed"
+                    ? "text-destructive"
+                    : "text-emerald-400"
+              }
+            >
+              {active ? "" : status === "failed" ? "×" : "✓"}
+            </span>
+            <span className="font-semibold">{String(request.publicModel)}</span>
+            <span className="truncate font-mono text-[10px] text-muted-foreground">
+              {committed
+                ? committed.type === "imported"
+                  ? `historical import · ${String(committed.model)}`
+                  : `${String(committed.provider)}/${String(committed.model)}`
+                : "selecting route"}
+            </span>
+          </div>
+          <div className="mt-1 font-mono text-[9px] text-muted-foreground">
+            {String(request.id).slice(0, 8)} ·{" "}
+            {new Date(String(request.startedAt)).toLocaleTimeString()}
+          </div>
+        </div>
+        <div className="text-right font-mono text-[9px] text-muted-foreground">
+          <div>{status}</div>
+          {usage ? (
+            <div>
+              {number(usage.prompt_tokens ?? usage.input_tokens).toLocaleString()} in ·{" "}
+              {number(usage.completion_tokens ?? usage.output_tokens).toLocaleString()} out
+            </div>
+          ) : null}
+        </div>
+      </div>
+      {routes.length > 0 ? (
+        <div className="flex gap-1.5 overflow-x-auto border-b border-border/50 px-3 py-2">
+          {routes.map((route, index) => (
+            <span
+              key={`${String(route.at)}-${index}`}
+              className={
+                route.type === "failure"
+                  ? "whitespace-nowrap rounded bg-destructive/10 px-2 py-1 font-mono text-[9px] text-destructive"
+                  : route.type === "committed"
+                    ? "whitespace-nowrap rounded bg-emerald-500/10 px-2 py-1 font-mono text-[9px] text-emerald-400"
+                    : "whitespace-nowrap rounded bg-muted px-2 py-1 font-mono text-[9px] text-muted-foreground"
+              }
+            >
+              {String(route.type)} · {String(route.provider)}/{String(route.model)}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="grid gap-px bg-border/50 sm:grid-cols-2">
+        <StreamPane label="Reasoning" text={reasoning} active={active && !content} muted />
+        <StreamPane label="Answer / tool stream" text={content} active={active} />
+      </div>
+      <RequestAudit request={request} />
+      {typeof request.error === "string" ? (
+        <div className="border-t border-destructive/30 bg-destructive/5 px-3 py-2 font-mono text-[10px] text-destructive">
+          {request.error}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function RouterConversationBrowser({
+  conversations,
+  selectedId,
+  selectedRequests,
+  loadError,
+  onSelect,
+}: {
+  conversations: RouterConversation[];
+  selectedId: string | null;
+  selectedRequests: JsonRecord[] | undefined;
+  loadError: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const selected = conversations.find((conversation) => conversation.id === selectedId);
+  if (!selected) return <EmptyState conversation label="a routed chat" />;
+
+  return (
+    <section className="overflow-hidden rounded-xl border border-border bg-card/25 md:flex md:min-h-[28rem]">
+      <div className="border-b border-border bg-background/35 md:w-64 md:shrink-0 md:border-r md:border-b-0">
+        <div className="hidden border-b border-border/70 px-3 py-3 md:block">
+          <h2 className="text-xs font-semibold">Chats</h2>
+          <p className="mt-0.5 text-[10px] text-muted-foreground">
+            {conversations.length} retained · newest first
+          </p>
+        </div>
+        <nav
+          className="flex gap-1.5 overflow-x-auto p-2 md:max-h-[calc(100vh-18rem)] md:flex-col md:overflow-y-auto"
+          aria-label="Observed chats"
+        >
+          {conversations.map((conversation) => {
+            const active = conversation.id === selected.id;
+            return (
+              <button
+                key={conversation.id}
+                type="button"
+                onClick={() => onSelect(conversation.id)}
+                className={`min-w-44 rounded-lg border px-3 py-2 text-left transition-colors md:min-w-0 ${
+                  active
+                    ? "border-sky-400/40 bg-sky-400/10"
+                    : "border-transparent hover:border-border hover:bg-accent/50"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={
+                      conversation.active
+                        ? "size-1.5 shrink-0 rounded-full bg-amber-400"
+                        : "size-1.5 shrink-0 rounded-full bg-emerald-400/70"
+                    }
+                  />
+                  <span className="truncate text-[11px] font-medium">
+                    {conversationLabel(conversation)}
+                  </span>
+                </div>
+                <div className="mt-1 flex justify-between gap-2 font-mono text-[9px] text-muted-foreground">
+                  <span>
+                    {conversation.requests.length} request
+                    {conversation.requests.length === 1 ? "" : "s"}
+                  </span>
+                  <span>{compactCount(conversation.totalTokens)} tok</span>
+                </div>
+                <div className="mt-0.5 truncate text-[9px] text-muted-foreground">
+                  {conversation.updatedAt
+                    ? new Date(conversation.updatedAt).toLocaleTimeString()
+                    : "waiting"}
+                </div>
+              </button>
+            );
+          })}
+        </nav>
+      </div>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/70 px-3 py-3 sm:px-4">
+          <div>
+            <h2 className="text-xs font-semibold">{conversationLabel(selected)}</h2>
+            <p className="mt-0.5 font-mono text-[9px] text-muted-foreground">
+              {selected.id} · full model requests and upstream response chunks available per trace
+            </p>
+          </div>
+          <div className="text-right font-mono text-[9px] text-muted-foreground">
+            <div>{selected.requests.length} inference requests</div>
+            <div>{selected.totalTokens.toLocaleString()} total tokens</div>
+          </div>
+        </div>
+        <div className="space-y-3 p-3 sm:p-4">
+          {loadError && !selectedRequests ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+              Could not load this conversation: {loadError}
+            </div>
+          ) : selectedRequests ? (
+            <RouterConversationRequests requests={selectedRequests} />
+          ) : (
+            <div className="animate-pulse py-8 text-center text-xs text-muted-foreground">
+              Loading conversation…
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RouterConversationRequests({ requests }: { requests: JsonRecord[] }) {
+  const displayedTurns = new Set<string>();
+  return requests.map((request) => {
+    const turnId = String(request.turnId ?? request.id);
+    const userMessage = typeof request.userMessage === "string" ? request.userMessage.trim() : "";
+    const showUserMessage = Boolean(userMessage) && !displayedTurns.has(turnId);
+    displayedTurns.add(turnId);
+    return (
+      <section key={String(request.id)} className="space-y-3">
+        {showUserMessage ? (
+          <div className="flex justify-end">
+            <div className="max-w-[92%] rounded-2xl rounded-br-sm bg-sky-500/10 px-3.5 py-2.5 sm:max-w-[80%]">
+              <div className="mb-1 flex items-center justify-between gap-4 text-[9px] font-medium uppercase tracking-wider text-sky-300">
+                <span>User</span>
+                <span className="font-mono font-normal text-muted-foreground">
+                  {new Date(String(request.startedAt)).toLocaleTimeString()}
+                </span>
+              </div>
+              <div className="whitespace-pre-wrap break-words text-xs leading-5">{userMessage}</div>
+            </div>
+          </div>
+        ) : null}
+        <RouterRequestCard request={request} />
+      </section>
+    );
+  });
+}
+
+function StreamPane({
+  label,
+  text,
+  active,
+  muted = false,
+}: {
+  label: string;
+  text: string;
+  active: boolean;
+  muted?: boolean;
+}) {
+  return (
+    <section className="min-h-24 bg-background/50 p-3">
+      <div className="mb-2 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div
+        className={`max-h-96 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 ${muted ? "text-muted-foreground" : "text-foreground"}`}
+      >
+        {text || (active ? "Waiting for stream…" : "No stream emitted")}
+        {active ? <span className="ml-0.5 animate-pulse text-amber-400">▌</span> : null}
+      </div>
+    </section>
   );
 }
 
@@ -1316,7 +1995,10 @@ function ActivityFooter({
   );
 }
 
-function EmptyState({ conversation = false, label = "the agent" }: {
+function EmptyState({
+  conversation = false,
+  label = "the agent",
+}: {
   conversation?: boolean;
   label?: string;
 }) {

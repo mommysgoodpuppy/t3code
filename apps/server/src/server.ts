@@ -19,6 +19,8 @@ import {
   httpCompressionLayer,
   lmToolsCampaignRouteLayer,
   lmToolsCampaignEventsRouteLayer,
+  lmToolsFreeRouterRequestRouteLayer,
+  lmToolsFreeRouterConversationRouteLayer,
 } from "./http.ts";
 import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
@@ -460,6 +462,8 @@ export const makeRoutesLayer = Layer.mergeAll(
     assetRouteLayer,
     lmToolsCampaignRouteLayer,
     lmToolsCampaignEventsRouteLayer,
+    lmToolsFreeRouterRequestRouteLayer,
+    lmToolsFreeRouterConversationRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),

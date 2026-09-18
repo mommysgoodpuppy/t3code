@@ -49,6 +49,8 @@ const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 const LM_TOOLS_CAMPAIGN_ROUTE = "/api/lm-tools/campaign";
 const LM_TOOLS_CAMPAIGN_EVENTS_ROUTE = "/api/lm-tools/campaign/events";
+const LM_TOOLS_FREE_ROUTER_REQUEST_ROUTE = "/api/lm-tools/free-router/request";
+const LM_TOOLS_FREE_ROUTER_CONVERSATION_ROUTE = "/api/lm-tools/free-router/conversation";
 
 type JsonRecord = Record<string, unknown>;
 type LmToolsObserverSnapshot = {
@@ -63,6 +65,8 @@ type LmToolsObserverSnapshot = {
   events: unknown[];
   stream?: { lastEventAt: string | null; bytes: number; lastEventMethod: string | null };
   inference?: unknown;
+  router?: unknown;
+  requests?: unknown[];
 };
 
 function jsonRecord(value: unknown): JsonRecord | null {
@@ -74,14 +78,8 @@ function jsonRecord(value: unknown): JsonRecord | null {
 function redactCommand(value: string): string {
   const secretName = "(?:password|passwd|token|api[_-]?key|secret)";
   return value
-    .replace(
-      new RegExp(`(["']${secretName}["']\\s*:\\s*)["'][^"']*["']`, "gi"),
-      '$1"***"',
-    )
-    .replace(
-      new RegExp(`(\\b${secretName}\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s;]+)`, "gi"),
-      "$1***",
-    )
+    .replace(new RegExp(`(["']${secretName}["']\\s*:\\s*)["'][^"']*["']`, "gi"), '$1"***"')
+    .replace(new RegExp(`(\\b${secretName}\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s;]+)`, "gi"), "$1***")
     .replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/gi, "$1***")
     .replace(/(https?:\/\/[^\s/:@]+:)[^\s/@]+@/gi, "$1***@");
 }
@@ -143,14 +141,12 @@ function readProxyInference(httpClient: HttpClient.HttpClient) {
     if (configured.length === 0) return null;
     const snapshots: Record<string, unknown>[] = [];
     for (const base of configured) {
-      const snapshot = yield* httpClient
-        .get(new URL("/lm-tools/inference", base).toString())
-        .pipe(
-          Effect.flatMap(HttpClientResponse.filterStatusOk),
-          Effect.flatMap((response) => response.json),
-          Effect.timeout("750 millis"),
-          Effect.orElseSucceed(() => null as unknown),
-        );
+      const snapshot = yield* httpClient.get(new URL("/lm-tools/inference", base).toString()).pipe(
+        Effect.flatMap(HttpClientResponse.filterStatusOk),
+        Effect.flatMap((response) => response.json),
+        Effect.timeout("750 millis"),
+        Effect.orElseSucceed(() => null as unknown),
+      );
       if (snapshot !== null && typeof snapshot === "object" && !Array.isArray(snapshot)) {
         snapshots.push(snapshot as Record<string, unknown>);
       }
@@ -177,13 +173,15 @@ function readProxyInference(httpClient: HttpClient.HttpClient) {
     const num = (value: unknown): number =>
       typeof value === "number" && Number.isFinite(value) ? value : 0;
     const promptSource = (prompting ?? primary).prompt;
-    const prompt = promptSource !== null && typeof promptSource === "object"
-      ? (promptSource as Record<string, unknown>)
-      : {};
+    const prompt =
+      promptSource !== null && typeof promptSource === "object"
+        ? (promptSource as Record<string, unknown>)
+        : {};
     const contextSource = withContext?.context;
-    const context = contextSource !== null && typeof contextSource === "object"
-      ? (contextSource as Record<string, unknown>)
-      : null;
+    const context =
+      contextSource !== null && typeof contextSource === "object"
+        ? (contextSource as Record<string, unknown>)
+        : null;
     return {
       ...primary,
       active: snapshots.some((entry) => entry.active === true),
@@ -197,10 +195,10 @@ function readProxyInference(httpClient: HttpClient.HttpClient) {
       },
       context: context
         ? {
-          used: num(context.used),
-          limit: num(context.limit),
-          percent: num(context.percent),
-        }
+            used: num(context.used),
+            limit: num(context.limit),
+            percent: num(context.percent),
+          }
         : null,
     };
   }).pipe(Effect.catchCause(() => Effect.succeed(null)));
@@ -263,14 +261,15 @@ function readModelInference(httpClient: HttpClient.HttpClient) {
     // reporting a finished evaluation forever. llama's slot is the liveness
     // authority: if nothing is evaluating there, nothing is evaluating.
     const slotIsPrompting = fromSlots?.phase === "prompt";
-    const merged = fromProxy.phase === "prompt" && !slotIsPrompting
-      ? {
-        ...fromProxy,
-        active: fromSlots?.active ?? false,
-        phase: fromSlots?.phase ?? "idle",
-        prompt: fromSlots?.prompt ?? fromProxy.prompt,
-      }
-      : fromProxy;
+    const merged =
+      fromProxy.phase === "prompt" && !slotIsPrompting
+        ? {
+            ...fromProxy,
+            active: fromSlots?.active ?? false,
+            phase: fromSlots?.phase ?? "idle",
+            prompt: fromSlots?.prompt ?? fromProxy.prompt,
+          }
+        : fromProxy;
     // Slot state backfills anything the proxies cannot answer yet: context usage
     // before a turn completes, and generated-token counts, which only llama has.
     // Cache hits are known to llama immediately but only reach the proxy with
@@ -280,8 +279,9 @@ function readModelInference(httpClient: HttpClient.HttpClient) {
     const withGenerated = {
       generatedTokens: fromSlots?.generatedTokens ?? 0,
       ...merged,
-      ...(mergedPrompt && !(typeof mergedPrompt.cached === "number" && mergedPrompt.cached > 0) &&
-          slotCached > 0
+      ...(mergedPrompt &&
+      !(typeof mergedPrompt.cached === "number" && mergedPrompt.cached > 0) &&
+      slotCached > 0
         ? { prompt: { ...mergedPrompt, cached: slotCached } }
         : {}),
     };
@@ -457,20 +457,23 @@ function readProxyTraceTail(fileSystem: FileSystem.FileSystem) {
         const event = jsonRecord(record?.event);
         if (!event) return [];
         const item = jsonRecord(event.item);
-        return [{
-          ...event,
-          ...(item && typeof item.command === "string"
-            ? { item: { ...item, command: redactCommand(item.command) } }
-            : {}),
-        }];
+        return [
+          {
+            ...event,
+            ...(item && typeof item.command === "string"
+              ? { item: { ...item, command: redactCommand(item.command) } }
+              : {}),
+          },
+        ];
       });
       const lastEvent = events.at(-1);
       return {
         ...tail,
         events: compactCampaignEvents(events),
-        lastEventMethod: typeof jsonRecord(lastEvent)?.method === "string"
-          ? jsonRecord(lastEvent)?.method as string
-          : null,
+        lastEventMethod:
+          typeof jsonRecord(lastEvent)?.method === "string"
+            ? (jsonRecord(lastEvent)?.method as string)
+            : null,
       };
     }),
   );
@@ -482,10 +485,7 @@ function readProxyTraceTail(fileSystem: FileSystem.FileSystem) {
  * state. No per-agent gateway API, and nothing to reimplement when the agent
  * on top changes.
  */
-function readProxySnapshot(
-  fileSystem: FileSystem.FileSystem,
-  httpClient: HttpClient.HttpClient,
-) {
+function readProxySnapshot(fileSystem: FileSystem.FileSystem, httpClient: HttpClient.HttpClient) {
   return Effect.gen(function* () {
     const title = process.env.LM_TOOLS_OBSERVER_TITLE ?? "Agent";
     const [inference, proxyTrace] = yield* Effect.all([
@@ -518,7 +518,40 @@ function readProxySnapshot(
         campaign: null,
         current: null,
         events: [],
-      })
+      }),
+    ),
+  );
+}
+
+/** Read the router's lightweight live projection; audit bodies are fetched on demand. */
+function readFreeRouterSnapshot(httpClient: HttpClient.HttpClient) {
+  return Effect.gen(function* () {
+    const baseUrl = process.env.LM_TOOLS_FREE_ROUTER_URL;
+    if (!baseUrl) throw new Error("LM_TOOLS_FREE_ROUTER_URL is not configured");
+    const snapshot = yield* httpClient
+      .get(new URL("/v1/free-router/observer?detail=summary", baseUrl).toString())
+      .pipe(
+        Effect.flatMap(HttpClientResponse.filterStatusOk),
+        Effect.flatMap((response) => response.json),
+        // Detailed audit snapshots can be much larger than the earlier telemetry-only payload.
+        Effect.timeout("10 seconds"),
+      );
+    const value = jsonRecord(snapshot);
+    if (!value) throw new Error("Free router returned an invalid observer snapshot");
+    return value as LmToolsObserverSnapshot;
+  }).pipe(
+    Effect.catchCause(() =>
+      Effect.succeed({
+        configured: false,
+        observer: {
+          kind: "free-router",
+          title: process.env.LM_TOOLS_OBSERVER_TITLE ?? "Free inference router",
+        },
+        campaign: null,
+        current: null,
+        events: [],
+        requests: [],
+      } satisfies LmToolsObserverSnapshot),
     ),
   );
 }
@@ -527,7 +560,9 @@ function readCampaignSnapshot(
   fileSystem: FileSystem.FileSystem,
   httpClient: HttpClient.HttpClient,
 ): Effect.Effect<LmToolsObserverSnapshot> {
-
+  if (process.env.LM_TOOLS_OBSERVER_SOURCE === "free-router") {
+    return readFreeRouterSnapshot(httpClient);
+  }
   if (process.env.LM_TOOLS_OBSERVER_SOURCE === "proxy") {
     return readProxySnapshot(fileSystem, httpClient).pipe(
       Effect.map((snapshot) => snapshot as LmToolsObserverSnapshot),
@@ -593,6 +628,56 @@ export const lmToolsCampaignRouteLayer = HttpRouter.add(
     const httpClient = yield* HttpClient.HttpClient;
     return HttpServerResponse.jsonUnsafe(yield* readCampaignSnapshot(fileSystem, httpClient));
   }),
+);
+
+export const lmToolsFreeRouterRequestRouteLayer = HttpRouter.add(
+  "GET",
+  LM_TOOLS_FREE_ROUTER_REQUEST_ROUTE,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    const id = Option.isSome(url) ? url.value.searchParams.get("id") : null;
+    const baseUrl = process.env.LM_TOOLS_FREE_ROUTER_URL;
+    if (!baseUrl || !id || process.env.LM_TOOLS_OBSERVER_SOURCE !== "free-router") {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    const httpClient = yield* HttpClient.HttpClient;
+    const upstream = new URL("/v1/free-router/observer/request", baseUrl);
+    upstream.searchParams.set("id", id);
+    const detail = yield* httpClient.get(upstream.toString()).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.json),
+      Effect.timeout("10 seconds"),
+    );
+    return HttpServerResponse.jsonUnsafe(detail);
+  }).pipe(
+    Effect.catchCause(() => Effect.succeed(HttpServerResponse.text("Not Found", { status: 404 }))),
+  ),
+);
+
+export const lmToolsFreeRouterConversationRouteLayer = HttpRouter.add(
+  "GET",
+  LM_TOOLS_FREE_ROUTER_CONVERSATION_ROUTE,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    const id = Option.isSome(url) ? url.value.searchParams.get("id") : null;
+    const baseUrl = process.env.LM_TOOLS_FREE_ROUTER_URL;
+    if (!baseUrl || !id || process.env.LM_TOOLS_OBSERVER_SOURCE !== "free-router") {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    const httpClient = yield* HttpClient.HttpClient;
+    const upstream = new URL("/v1/free-router/observer/conversation", baseUrl);
+    upstream.searchParams.set("id", id);
+    const detail = yield* httpClient.get(upstream.toString()).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.json),
+      Effect.timeout("10 seconds"),
+    );
+    return HttpServerResponse.jsonUnsafe(detail);
+  }).pipe(
+    Effect.catchCause(() => Effect.succeed(HttpServerResponse.text("Not Found", { status: 404 }))),
+  ),
 );
 
 export const lmToolsCampaignEventsRouteLayer = HttpRouter.add(
@@ -684,28 +769,30 @@ export const lmToolsCampaignEventsRouteLayer = HttpRouter.add(
       ).pipe(Effect.orElseSucceed(() => Option.none<Uint8Array>()));
     });
 
-    const snapshots = process.env.LM_TOOLS_OBSERVER_SOURCE === "proxy"
-      ? Stream.concat(
-        Stream.fromEffect(snapshot),
-        Stream.fromSchedule(Schedule.spaced("1 second")).pipe(
-          Stream.mapEffect(() => readCampaignSnapshot(fileSystem, httpClient)),
-          Stream.map((value) => JSON.stringify(value)),
-          Stream.changes,
-          Stream.map((value) => encode("snapshot", JSON.parse(value) as unknown)),
-        ),
-      )
-      : Stream.concat(
-        Stream.fromEffect(snapshot),
-        Stream.fromSchedule(Schedule.spaced("25 millis")).pipe(
-          Stream.mapEffect(() => readAppend),
-          Stream.filterMap((value) =>
-            Option.match(value, {
-              onNone: () => Result.failVoid,
-              onSome: Result.succeed,
-            }),
-          ),
-        ),
-      );
+    const snapshots =
+      process.env.LM_TOOLS_OBSERVER_SOURCE === "proxy" ||
+      process.env.LM_TOOLS_OBSERVER_SOURCE === "free-router"
+        ? Stream.concat(
+            Stream.fromEffect(snapshot),
+            Stream.fromSchedule(Schedule.spaced("1 second")).pipe(
+              Stream.mapEffect(() => readCampaignSnapshot(fileSystem, httpClient)),
+              Stream.map((value) => JSON.stringify(value)),
+              Stream.changes,
+              Stream.map((value) => encode("snapshot", JSON.parse(value) as unknown)),
+            ),
+          )
+        : Stream.concat(
+            Stream.fromEffect(snapshot),
+            Stream.fromSchedule(Schedule.spaced("25 millis")).pipe(
+              Stream.mapEffect(() => readAppend),
+              Stream.filterMap((value) =>
+                Option.match(value, {
+                  onNone: () => Result.failVoid,
+                  onSome: Result.succeed,
+                }),
+              ),
+            ),
+          );
     const inferenceUpdates = Stream.fromSchedule(Schedule.spaced("100 millis")).pipe(
       Stream.mapEffect(() => readModelInference(httpClient)),
       Stream.map((inference) => JSON.stringify(inference)),
@@ -714,7 +801,11 @@ export const lmToolsCampaignEventsRouteLayer = HttpRouter.add(
         encode("inference", { inference: JSON.parse(inference) as unknown }),
       ),
     );
-    return HttpServerResponse.stream(Stream.merge(snapshots, inferenceUpdates), {
+    const output =
+      process.env.LM_TOOLS_OBSERVER_SOURCE === "free-router"
+        ? snapshots
+        : Stream.merge(snapshots, inferenceUpdates);
+    return HttpServerResponse.stream(output, {
       headers: {
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
